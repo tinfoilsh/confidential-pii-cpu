@@ -16,7 +16,7 @@ from pydantic import BaseModel
 log = logging.getLogger("privacy-filter")
 logging.basicConfig(level=logging.INFO)
 
-CHECKPOINT_DIR = os.environ.get("OPF_CHECKPOINT", "/tinfoil/mwp/privacy-filter")
+CHECKPOINT_DIR = os.environ.get("OPF_CHECKPOINT", "/tinfoil/mpk/privacy-filter")
 DEVICE = os.environ.get("OPF_DEVICE", "cpu")
 
 _opf = None
