@@ -1,0 +1,83 @@
+# Tinfoil Containers release workflow (phase 1 — initiate a release).
+#
+# Run from a branch via "Run workflow" with a version. It builds the image,
+# writes its digest into tinfoil-config.yml, creates the release tag, then
+# dispatches phase 2 (tinfoil-release-publish.yml) to attest and publish.
+
+name: Tinfoil Release
+
+run-name: Release ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. v0.1.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: tinfoil-container-release-${{ inputs.version }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with: { persist-credentials: false }
+
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ghcr.io/tinfoilsh/confidential-pii-cpu
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.version }}
+            type=sha,format=short
+
+      - id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        env: { SOURCE_DATE_EPOCH: 0 }
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  prepare-release:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Update tinfoil-config.yml and create the release tag
+        uses: tinfoilsh/update-container-action@5e0a3789316941664cee055706799114e0180565 # v0.6.0
+        with:
+          version: ${{ inputs.version }}
+          source-sha: ${{ github.sha }}
+          update-config: true
+          image-refs: |
+            ghcr.io/tinfoilsh/confidential-pii-cpu@${{ needs.build.outputs.digest }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Dispatch the publish workflow on the new tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: gh workflow run tinfoil-release-publish.yml --ref "$VERSION"
