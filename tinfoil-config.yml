@@ -9,7 +9,7 @@ networks:
 
 containers:
   - name: "privacy-filter"
-    image: "ghcr.io/tinfoilsh/confidential-pii-cpu@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
+    image: "ghcr.io/tinfoilsh/confidential-pii-cpu@sha256:dfeb651fd36c82c21afa03662cb6e72e8a204ce4fcf0de4cd2fd2c498821c8cd" # v0.1.2
     restart: always
     networks: ["app"]
     env:
