@@ -11,6 +11,7 @@ containers:
   - name: "privacy-filter"
     image: "ghcr.io/tinfoilsh/confidential-pii-cpu@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
     restart: always
+    networks: ["app"]
     env:
       - HF_HOME: "/hf-cache"
       - OPF_CHECKPOINT: "/hf-cache/privacy-filter"
