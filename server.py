@@ -1,8 +1,9 @@
 """OpenAI Privacy Filter inference server.
 
 Exposes POST /redact for PII span detection and redaction using the
-openai/privacy-filter token-classification model. The model downloads
-from HuggingFace on first boot and is cached on a persistent volume.
+openai/privacy-filter token-classification model. The model is mounted
+as a verified modelwrap (MWP) read-only filesystem at boot — no
+HuggingFace download or egress required.
 """
 
 import logging
@@ -15,8 +16,7 @@ from pydantic import BaseModel
 log = logging.getLogger("privacy-filter")
 logging.basicConfig(level=logging.INFO)
 
-MODEL_ID = "openai/privacy-filter"
-CHECKPOINT_DIR = os.environ.get("OPF_CHECKPOINT", "/hf-cache/privacy-filter")
+CHECKPOINT_DIR = os.environ.get("OPF_CHECKPOINT", "/tinfoil/mwp/privacy-filter")
 DEVICE = os.environ.get("OPF_DEVICE", "cpu")
 
 _opf = None
@@ -24,22 +24,13 @@ _opf = None
 
 def load_model():
     global _opf
-    from huggingface_hub import snapshot_download
     from opf import OPF
 
-    if not os.path.isdir(CHECKPOINT_DIR) or not os.listdir(CHECKPOINT_DIR):
-        log.info("Downloading %s to %s ...", MODEL_ID, CHECKPOINT_DIR)
-        # Skip onnx/ (~12.7 GB) and original/ (~2.8 GB duplicate) — the OPF
-        # runtime only needs config.json + *.safetensors + tokenizer + viterbi.
-        snapshot_download(
-            MODEL_ID,
-            local_dir=CHECKPOINT_DIR,
-            ignore_patterns=["onnx/*", "original/*"],
-        )
-    else:
-        log.info("Loading model from %s", CHECKPOINT_DIR)
-
+    log.info("Loading model from %s", CHECKPOINT_DIR)
     _opf = OPF(model=CHECKPOINT_DIR, device=DEVICE)
+    # Force eager weight loading — OPF() is lazy, so run a dummy redaction
+    # to load tensors into memory before serving requests.
+    _opf.redact("warmup")
     log.info("Model loaded on %s", DEVICE)
 
 
