@@ -10,7 +10,7 @@ models:
 
 containers:
   - name: "privacy-filter"
-    image: "ghcr.io/tinfoilsh/confidential-pii-cpu@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
+    image: "ghcr.io/tinfoilsh/confidential-pii-cpu@sha256:feb8dd05fe988007235c75baac2d9c2c84abd049a538cd423b6c79196644febf" # v0.1.3
     restart: always
     env:
       - OPF_CHECKPOINT: "/tinfoil/mwp/mwp-7553ee1828e0df70820ff1f87faf70c79418963dad4c7a331f642ced46add02b"
