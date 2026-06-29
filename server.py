@@ -4,6 +4,7 @@ Exposes POST /redact for PII span detection and redaction using the
 openai/privacy-filter token-classification model. The model downloads
 from HuggingFace on first boot and is cached on a persistent volume.
 """
+
 import logging
 import os
 from contextlib import asynccontextmanager
