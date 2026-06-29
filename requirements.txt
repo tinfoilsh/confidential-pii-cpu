@@ -1,0 +1,10 @@
+# Pinned dependencies for the OpenAI Privacy Filter server.
+# torch is intentionally excluded — it is platform-specific:
+#   - CPU Dockerfile installs it from https://download.pytorch.org/whl/cpu
+#   - GPU Dockerfile uses the pytorch/pytorch base image (torch preinstalled)
+#
+# opf pinned to openai/privacy-filter commit f7f00ca (2025-04-22 release).
+opf @ https://github.com/openai/privacy-filter/archive/f7f00ca7fb869683eb732c010299d901457f19c3.tar.gz#sha256=c79c613e3600bfee1357fb37528d439e703484f590552ffe9ef79a8050ccbe39
+fastapi==0.138.2
+huggingface_hub==1.21.0
+uvicorn[standard]==0.49.0
