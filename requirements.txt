@@ -4,7 +4,8 @@
 #   - GPU Dockerfile uses the pytorch/pytorch base image (torch preinstalled)
 #
 # opf pinned to openai/privacy-filter commit f7f00ca (2025-04-22 release).
+# huggingface_hub is a transitive dep of opf (not used directly — the model
+# is mounted via MWP, not downloaded at runtime).
 opf @ https://github.com/openai/privacy-filter/archive/f7f00ca7fb869683eb732c010299d901457f19c3.tar.gz#sha256=c79c613e3600bfee1357fb37528d439e703484f590552ffe9ef79a8050ccbe39
 fastapi==0.138.2
-huggingface_hub==1.21.0
 uvicorn[standard]==0.49.0
