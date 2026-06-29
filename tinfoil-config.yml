@@ -9,7 +9,7 @@ networks:
 
 containers:
   - name: "privacy-filter"
-    image: "ghcr.io/tinfoilsh/confidential-pii-cpu@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
+    image: "ghcr.io/tinfoilsh/confidential-pii-cpu@sha256:89d4802f7f69d46dd6102e2d64dbdf5c292385e8111f58ba163252d8b825a829" # v0.1.0
     restart: always
     env:
       - HF_HOME: "/hf-cache"
