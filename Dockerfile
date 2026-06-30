@@ -23,7 +23,9 @@ COPY server.py /app/server.py
 WORKDIR /app
 
 ENV OPF_DEVICE=cpu \
-    TIKTOKEN_CACHE_DIR=/app/tiktoken_cache
+    TIKTOKEN_CACHE_DIR=/app/tiktoken_cache \
+    OPF_NUM_THREADS=32 \
+    OPF_MAX_CONCURRENCY=1
 
 EXPOSE 8001
 
