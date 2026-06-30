@@ -1,6 +1,6 @@
 cvm-version: 0.10.4
-cpus: 4
-memory: 16384
+cpus: 32
+memory: 32768
 gpus: 0
 
 models:
@@ -15,6 +15,8 @@ containers:
     env:
       - OPF_CHECKPOINT: "/tinfoil/mpk/mpk-7553ee1828e0df70820ff1f87faf70c79418963dad4c7a331f642ced46add02b/original"
       - OPF_DEVICE: "cpu"
+      - OPF_NUM_THREADS: "32"
+      - OPF_MAX_CONCURRENCY: "1"
     tmpfs:
       /tmp: size=512m,mode=1777,exec
       /root: size=2g,mode=0700,exec
