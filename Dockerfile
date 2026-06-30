@@ -15,10 +15,8 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 # Pre-populate tiktoken cache so o200k_base doesn't need network egress.
-# tiktoken caches by sha1(url), so the filename is deterministic.
-RUN TIKTOKEN_CACHE_DIR=/tmp/tiktoken_cache \
-    python -c "import tiktoken; tiktoken.get_encoding('o200k_base')" \
-    && mv /tmp/tiktoken_cache /app/tiktoken_cache
+# The cache file is named by sha1(url) — deterministic, never changes.
+COPY tiktoken_cache /app/tiktoken_cache
 
 COPY server.py /app/server.py
 
