@@ -13,7 +13,7 @@ containers:
     image: "ghcr.io/tinfoilsh/confidential-pii-cpu@sha256:68b9ae91855d8020b83eb7362bd1632b5c053bc88611d55c4fcd745ca172c5f9"
     restart: always
     env:
-      - OPF_CHECKPOINT: "/tinfoil/mpk/mpk-d8de260d205c89df009794749bb1d463e06c8b560a989dc8999fc3f7a77a0cb9_17419419648_3892cd2f-a06e-5aee-8276-93140b9f06ec/original"
+      - OPF_CHECKPOINT: "/tinfoil/mpk/mpk-d8de260d205c89df009794749bb1d463e06c8b560a989dc8999fc3f7a77a0cb9/original"
       - OPF_DEVICE: "cpu"
       - OPF_NUM_THREADS: "32"
       - OPF_MAX_CONCURRENCY: "1"
