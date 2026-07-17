@@ -32,6 +32,8 @@ shim:
   authenticated: true
   authenticated-endpoints:
     - /redact
+    - /metrics
   paths:
     - /redact
     - /health
+    - /metrics
