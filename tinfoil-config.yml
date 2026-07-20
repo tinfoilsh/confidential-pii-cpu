@@ -1,6 +1,6 @@
 cvm-version: 0.10.4
 cpus: 16
-memory: 16384
+memory: 65536 # should be 16384 (16GB); bumped to match medium_1d_new hardware platform for attestation
 gpus: 0
 
 models:
