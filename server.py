@@ -26,7 +26,7 @@ from starlette.concurrency import run_in_threadpool
 log = logging.getLogger("privacy-filter")
 logging.basicConfig(level=logging.INFO)
 
-CHECKPOINT_DIR = os.environ.get("OPF_CHECKPOINT", "/tinfoil/mpk/privacy-filter")
+CHECKPOINT_DIR = os.environ.get("OPF_CHECKPOINT", "/tinfoil/models/privacy-filter/original")
 DEVICE = os.environ.get("OPF_DEVICE", "cpu")
 # Inference runs one request at a time with no way to interrupt a forward
 # pass, so a single oversized input can hold the slot for minutes while
