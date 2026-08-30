@@ -17,6 +17,8 @@ containers:
       - OPF_DEVICE: "cpu"
       - OPF_NUM_THREADS: "16"
       - OPF_MAX_CONCURRENCY: "1"
+    secrets:
+      - METRICS_API_KEY
     tmpfs:
       /tmp: size=512m,mode=1777,exec
       /root: size=2g,mode=0700,exec
