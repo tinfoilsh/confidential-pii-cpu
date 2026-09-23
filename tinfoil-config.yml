@@ -19,10 +19,11 @@ containers:
       - OPF_MAX_CONCURRENCY: "1"
     secrets:
       - METRICS_API_KEY
+      - USAGE_REPORTER_SECRET
     tmpfs:
       /tmp: size=512m,mode=1777,exec
       /root: size=2g,mode=0700,exec
-    command: ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8001"]
+    command: ["/usr/local/bin/privacy-filter"]
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
       interval: 30s
