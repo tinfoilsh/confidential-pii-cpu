@@ -1,0 +1,4 @@
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/tinfoilsh/usage-reporting-go v0.1.4 h1:RS2DhXG6VitnlZb2628gqO16ZU1NxGJ1gQdqzlp50Es=
+github.com/tinfoilsh/usage-reporting-go v0.1.4/go.mod h1:1lXVGmDbEmlAdUo+0YPsUYuFVtr74xycCs0K4fSnwYs=

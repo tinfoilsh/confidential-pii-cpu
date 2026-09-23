@@ -1,6 +1,13 @@
 # CPU image for the OpenAI Privacy Filter (opf) token-classification model.
 # Model weights are mounted as a verified modelwrap (MWP) read-only
 # filesystem at boot — no HuggingFace download or egress required.
+FROM golang:1.27.1 AS billing-build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY *.go ./
+RUN CGO_ENABLED=0 go build -trimpath -o /privacy-filter .
+
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
@@ -19,6 +26,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 COPY tiktoken_cache /app/tiktoken_cache
 
 COPY server.py /app/server.py
+COPY --from=billing-build /privacy-filter /usr/local/bin/privacy-filter
 
 WORKDIR /app
 
@@ -29,4 +37,4 @@ ENV OPF_DEVICE=cpu \
 
 EXPOSE 8001
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["/usr/local/bin/privacy-filter"]
