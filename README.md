@@ -31,6 +31,8 @@ Requires a Tinfoil bearer credential validated by the shim. Each HTTP 200 infere
 }
 ```
 
+Inputs are limited to `OPF_MAX_INPUT_TOKENS` (16384) tokens; longer text is rejected with 413 before inference. When `OPF_MAX_QUEUE_DEPTH` (64) requests are already running or waiting, new requests are rejected with 503 rather than queued. Neither rejection is charged.
+
 ### `GET /health`
 
 Returns `{"status": "ok"}` once the model is loaded.
@@ -45,6 +47,6 @@ Returns `{"status": "ok"}` once the model is loaded.
 
 The release workflow builds the image and updates its measured digest. `USAGE_REPORTER_SECRET` must be provisioned before deployment; startup fails if it is absent. `CONTROL_PLANE_URL` defaults to `https://api.tinfoil.sh`. The reporter ID is `pii-filter`.
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for the cross-service rollout and rollback order. Run `go test -race ./...` for the front-end tests; they use local HTTP fixtures and the real signing/batching client without loading model weights.
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the cross-service rollout and rollback order. Run `go test -race ./...` for the front-end tests; they use local HTTP fixtures and the real signing/batching client without loading model weights. Run `pip install -r requirements-test.txt && python -m pytest test_server.py` for the admission-control tests, which stub the model.
 
 Full API and pricing documentation: [Privacy filter](https://docs.tinfoil.sh/guides/privacy-filter).
