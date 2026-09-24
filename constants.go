@@ -18,4 +18,7 @@ const (
 	inferenceTimeout       = 2 * time.Minute
 	shutdownTimeout        = 30 * time.Second
 	reportFlushTimeout     = 10 * time.Second
+	healthProbeInterval    = 30 * time.Second
+	healthProbeTimeout     = 5 * time.Second
+	healthFailureThreshold = 3
 )
