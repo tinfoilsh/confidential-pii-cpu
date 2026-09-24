@@ -1,0 +1,5 @@
+# Server admission tests. These stub the model, so torch and opf are not needed.
+fastapi==0.138.2
+prometheus_client==0.24.1
+httpx==0.28.1
+pytest==9.1.1

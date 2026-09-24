@@ -12,7 +12,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, HTTPException, Response
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     Counter,
@@ -28,9 +28,18 @@ logging.basicConfig(level=logging.INFO)
 
 CHECKPOINT_DIR = os.environ.get("OPF_CHECKPOINT", "/tinfoil/mpk/privacy-filter")
 DEVICE = os.environ.get("OPF_DEVICE", "cpu")
+# Inference runs one request at a time with no way to interrupt a forward
+# pass, so a single oversized input can hold the slot for minutes while
+# everything behind it queues and times out. Reject long inputs up front and
+# refuse to queue beyond what can plausibly be served within the gateway's
+# two-minute deadline.
+MAX_INPUT_TOKENS = int(os.environ.get("OPF_MAX_INPUT_TOKENS", "16384"))
+MAX_QUEUE_DEPTH = int(os.environ.get("OPF_MAX_QUEUE_DEPTH", "64"))
 
 _opf = None
 _semaphore = None
+_encoding = None
+_queued = 0
 
 REQUESTS_TOTAL = Counter(
     "pii_filter_requests_total",
@@ -62,7 +71,7 @@ MODEL_LOADED = Gauge(
 
 
 def load_model():
-    global _opf, _semaphore
+    global _opf, _semaphore, _encoding
     import torch
 
     n_threads = int(os.environ.get("OPF_NUM_THREADS", str(os.cpu_count() or 1)))
@@ -75,6 +84,7 @@ def load_model():
     # Force eager weight loading — OPF() is lazy, so run a dummy redaction
     # to load tensors into memory before serving requests.
     _opf.redact("warmup")
+    _encoding = _opf.get_prediction_components()[0].encoding
     max_concurrency = int(os.environ.get("OPF_MAX_CONCURRENCY", "1"))
     _semaphore = asyncio.Semaphore(max_concurrency)
     MODEL_LOADED.set(1)
@@ -123,6 +133,18 @@ def metrics():
 
 @app.post("/redact", response_model=RedactResponse)
 async def redact(req: RedactRequest):
+    global _queued
+    token_count = len(_encoding.encode(req.text, allowed_special="all"))
+    if token_count > MAX_INPUT_TOKENS:
+        REQUESTS_TOTAL.labels(status="too_long").inc()
+        raise HTTPException(
+            status_code=413,
+            detail=f"text is {token_count} tokens; the limit is {MAX_INPUT_TOKENS}",
+        )
+    if _queued >= MAX_QUEUE_DEPTH:
+        REQUESTS_TOTAL.labels(status="overloaded").inc()
+        raise HTTPException(status_code=503, detail="privacy filter is at capacity")
+    _queued += 1
     REQUESTS_RUNNING.inc()
     start = time.time()
     status = "success"
@@ -138,6 +160,7 @@ async def redact(req: RedactRequest):
         status = "error"
         raise
     finally:
+        _queued -= 1
         REQUESTS_TOTAL.labels(status=status).inc()
         REQUEST_DURATION.labels(status=status).observe(time.time() - start)
         REQUESTS_RUNNING.dec()
