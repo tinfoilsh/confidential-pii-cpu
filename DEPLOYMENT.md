@@ -28,3 +28,16 @@ Roll back the PII endpoint first to stop endpoint-owned charges, and drain it be
 ## Operational limits
 
 The request-body cap is 4 MiB, inference timeout is two minutes, and Python concurrency remains controlled by `OPF_MAX_CONCURRENCY`. Inference cannot be interrupted once started, so Python also rejects inputs over `OPF_MAX_INPUT_TOKENS` with 413 and sheds load with 503 once `OPF_MAX_QUEUE_DEPTH` requests are running or waiting; a single long input could otherwise hold every lane while callers behind it time out. The Go front end drains for up to 30 seconds on shutdown and then flushes its reporter with a bounded timeout. A client disconnect or lost response does not undo completed inference; if no receipt arrives, callers must treat its billing outcome as unknown rather than retrying under a free-request assumption.
+
+## Health and restarts
+
+`GET /health` returns `{"status": "ok"}` once the model is loaded and 503 while the request queue is full. Docker's restart policy only fires when the process exits, so the Go front end probes `/health` every 30 seconds and exits after three consecutive failures, letting `restart: always` replace a wedged inference process. Failures before the first successful probe are ignored so model loading never counts.
+
+## Release and configuration
+
+The `Tinfoil Release` workflow builds the image, writes its measured digest into `tinfoil-config.yml`, and publishes the attested release. `USAGE_REPORTER_SECRET` must be provisioned before deployment; startup fails if it is absent. `CONTROL_PLANE_URL` defaults to `https://api.tinfoil.sh` and the reporter ID is `pii-filter`. The container needs egress to `api.tinfoil.sh` for usage delivery; without the `networks` allowlist in `tinfoil-config.yml` every batch is dropped and filter requests go unbilled.
+
+## Tests
+
+- `go test -race ./...` exercises the front end with local HTTP fixtures and the real signing and batching client, without loading model weights.
+- `pip install -r requirements-test.txt && python -m pytest test_server.py` exercises admission control and health with a stubbed model.
