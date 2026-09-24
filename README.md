@@ -35,7 +35,7 @@ Inputs are limited to `OPF_MAX_INPUT_TOKENS` (16384) tokens; longer text is reje
 
 ### `GET /health`
 
-Returns `{"status": "ok"}` once the model is loaded.
+Returns `{"status": "ok"}` once the model is loaded, and 503 while the request queue is full. The Go front end probes it every 30 seconds and exits after three consecutive failures so Docker's restart policy replaces a wedged inference process.
 
 ## Model
 

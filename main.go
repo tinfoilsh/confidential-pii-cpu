@@ -65,6 +65,7 @@ func run(ctx context.Context) error {
 	backendDone := make(chan error, 1)
 	go func() { backendDone <- backend.Wait() }()
 	target, _ := url.Parse(inferenceURL)
+	unhealthy := watchHealth(backendCtx, inferenceURL+healthPath, healthProbeInterval)
 	server := &http.Server{Addr: listenAddress, Handler: newGateway(target, reporter), ReadHeaderTimeout: headerTimeout, ReadTimeout: inferenceTimeout, IdleTimeout: inferenceTimeout}
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.ListenAndServe() }()
@@ -75,6 +76,10 @@ func run(ctx context.Context) error {
 	case err := <-backendDone:
 		backendExited = true
 		result = fmt.Errorf("inference exited unexpectedly: %v", err)
+	case err := <-unhealthy:
+		// Exiting lets Docker's restart policy replace the wedged process;
+		// an unhealthy state alone never triggers a restart.
+		result = fmt.Errorf("inference unhealthy: %w", err)
 	case err := <-serverDone:
 		if !errors.Is(err, http.ErrServerClosed) {
 			result = err

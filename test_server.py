@@ -72,6 +72,19 @@ def test_rejects_input_over_token_limit_without_inference(model):
     assert not model.started.is_set()
 
 
+def test_health_fails_while_queue_is_full(model):
+    async def run():
+        async with client() as c:
+            server._queued = server.MAX_QUEUE_DEPTH
+            full = await c.get("/health")
+            server._queued = 0
+            return full, await c.get("/health")
+
+    full, after = asyncio.run(run())
+    assert full.status_code == 503
+    assert after.status_code == 200
+
+
 def test_sheds_load_once_queue_is_full(model):
     async def run():
         async with client() as c:
