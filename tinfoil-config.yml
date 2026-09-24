@@ -1,4 +1,5 @@
-cvm-version: 0.11.0
+# Named model mounts under /tinfoil/models need cvmimage 0.12.0 or newer.
+cvm-version: 0.14.10
 # Two inference lanes of 16 threads each, so one long input cannot stall every
 # caller behind it.
 cpus: 32
