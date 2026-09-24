@@ -22,7 +22,7 @@ containers:
       - OPF_DEVICE: "cpu"
       - OPF_NUM_THREADS: "16"
       - OPF_MAX_CONCURRENCY: "2"
-      - OPF_MAX_INPUT_TOKENS: "16384"
+      - OPF_MAX_INPUT_TOKENS: "8192"
       - OPF_MAX_QUEUE_DEPTH: "64"
     secrets:
       - METRICS_API_KEY
