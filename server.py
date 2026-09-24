@@ -123,6 +123,11 @@ class RedactResponse(BaseModel):
 
 @app.get("/health")
 def health():
+    # A full queue means inference is stuck, not busy: the gateway times
+    # every waiting request out after two minutes, so a healthy server never
+    # accumulates this many.
+    if _queued >= MAX_QUEUE_DEPTH:
+        raise HTTPException(status_code=503, detail="privacy filter is at capacity")
     return {"status": "ok"}
 
 
