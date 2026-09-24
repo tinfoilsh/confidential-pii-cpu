@@ -33,7 +33,7 @@ DEVICE = os.environ.get("OPF_DEVICE", "cpu")
 # everything behind it queues and times out. Reject long inputs up front and
 # refuse to queue beyond what can plausibly be served within the gateway's
 # two-minute deadline.
-MAX_INPUT_TOKENS = int(os.environ.get("OPF_MAX_INPUT_TOKENS", "16384"))
+MAX_INPUT_TOKENS = int(os.environ.get("OPF_MAX_INPUT_TOKENS", "8192"))
 MAX_QUEUE_DEPTH = int(os.environ.get("OPF_MAX_QUEUE_DEPTH", "64"))
 
 _opf = None
