@@ -1,7 +1,9 @@
 # Named model mounts under /tinfoil/models need cvmimage 0.12.0 or newer.
 cvm-version: 0.14.10
-# Two inference lanes of 16 threads each, so one long input cannot stall every
-# caller behind it.
+# Two inference worker processes of 16 threads each (dispatched least-busy by
+# the gateway), so one long input cannot stall every caller behind it. Workers
+# are separate processes: a shared semaphore was measured to serialize them
+# (each concurrent request ran ~2x slower with no throughput gain).
 cpus: 32
 memory: 65536 # should be 16384 (16GB); bumped to match medium_1d_new hardware platform for attestation
 gpus: 0
@@ -21,7 +23,9 @@ containers:
       - OPF_CHECKPOINT: "/tinfoil/models/privacy-filter/original"
       - OPF_DEVICE: "cpu"
       - OPF_NUM_THREADS: "16"
-      - OPF_MAX_CONCURRENCY: "2"
+      - OPF_MAX_CONCURRENCY: "1"
+      - OPF_WORKERS: "2"
+      - OPF_PIN_WORKERS: "0"
       - OPF_MAX_INPUT_TOKENS: "8192"
       - OPF_MAX_QUEUE_DEPTH: "64"
     secrets:

@@ -6,3 +6,5 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/tinfoilsh/usage-reporting-go v0.1.4
 )
+
+require golang.org/x/sys v0.48.0
