@@ -1,28 +1,7 @@
-From 33c7a85adf1fec61867d5c9e287a3970e263bdbc Mon Sep 17 00:00:00 2001
-From: Daniel MS <danielmccannsayles@gmail.com>
-Date: Wed, 7 Oct 2026 17:25:37 -0700
-Subject: [PATCH] cpu: group MoE tokens by expert instead of gathering expert
- weights
-
-The non-Triton MoE fallback gathered (copied) the selected experts' full
-mlp1/mlp2 weight matrices for every 32-token chunk in every layer, then
-converted them to float32 \u2014 on CPU this memcpy traffic dominated inference
-~6x over the matmuls it fed (profiled: aten::index 85% of a forward pass).
-
-Reuse the Triton path's algorithm in plain torch: sort token slots by
-expert, run each chosen expert's weights in place exactly once per call,
-and scatter the gate-weighted results back with one index_add_. Weight
-tensors are never copied; only token activations move. Chunking
-(torch_ops_batch) is no longer needed since peak memory no longer scales
-with chunk size.
----
- opf/_model/model.py | 91 ++++++++++++++++++++++++++-------------------
- 1 file changed, 53 insertions(+), 38 deletions(-)
-
-diff --git a/opf/_model/model.py b/opf/_model/model.py
+diff --git a/usr/local/lib/python3.12/site-packages/opf/_model/model.py b/usr/local/lib/python3.12/site-packages/opf/_model/model.py
 index 22b3d4c..66a2160 100644
---- a/opf/_model/model.py
-+++ b/opf/_model/model.py
+--- a/usr/local/lib/python3.12/site-packages/opf/_model/model.py
++++ b/usr/local/lib/python3.12/site-packages/opf/_model/model.py
 @@ -828,48 +828,63 @@ class MLPBlock(torch.nn.Module):
                  out_accum.index_add_(0, token_ids_sorted, o.float())
                  out_accum = out_accum * experts_per_token_eff
@@ -125,6 +104,3 @@ index 22b3d4c..66a2160 100644
          if effective_batch and t.shape[0] > effective_batch:
              chunks = []
              for start in range(0, t.shape[0], effective_batch):
--- 
-2.54.0 (Apple Git-157)
-

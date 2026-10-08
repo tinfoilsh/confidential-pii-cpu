@@ -10,7 +10,7 @@ RUN CGO_ENABLED=0 go build -trimpath -o /privacy-filter .
 
 FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+RUN apt-get update && apt-get install -y --no-install-recommends curl patch \
     && rm -rf /var/lib/apt/lists/*
 
 # CPU-only torch first (from the PyTorch CPU index, not PyPI which serves the
@@ -20,6 +20,19 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Patches are -p1 unified diffs rooted at /; they target
+# usr/local/lib/python3.12/site-packages/... to match this image.
+COPY patches/ /tmp/tinfoil-patches/
+RUN set -eux; \
+    cd /; \
+    for p in /tmp/tinfoil-patches/*.patch; do \
+        echo "Applying $(basename "$p")"; \
+        /usr/bin/patch -p1 --no-backup-if-mismatch --fuzz=0 < "$p"; \
+    done; \
+    find /usr/local/lib/python3.12/site-packages/opf -name '__pycache__' -type d -exec rm -rf {} + || true; \
+    rm -rf /tmp/tinfoil-patches; \
+    python3 -c "import opf; print('opf with tinfoil patches')"
 
 # Pre-populate tiktoken cache so o200k_base doesn't need network egress.
 # The cache file is named by sha1(url) — deterministic, never changes.
