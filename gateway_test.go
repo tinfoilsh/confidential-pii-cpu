@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -197,28 +196,6 @@ func TestGatewayDispatchesConcurrentRequestsToIdleWorkers(t *testing.T) {
 	}
 	close(release)
 	<-done
-}
-
-func TestWorkerCPUBounds(t *testing.T) {
-	cpus := runtime.NumCPU()
-	start, end, err := workerCPUBounds(0, 1)
-	if err != nil || start != 0 || end != cpus-1 {
-		t.Fatalf("single worker bounds %d-%d, %v", start, end, err)
-	}
-	if cpus >= 2 {
-		per := cpus / 2
-		a0, a1, _ := workerCPUBounds(0, 2)
-		b0, b1, _ := workerCPUBounds(1, 2)
-		if a0 != 0 || a1 != per-1 || b0 != per || b1 != cpus-1 {
-			t.Fatalf("two-worker bounds %d-%d / %d-%d", a0, a1, b0, b1)
-		}
-		if a1 >= b0 {
-			t.Fatal("worker CPU ranges overlap")
-		}
-	}
-	if _, _, err := workerCPUBounds(0, cpus+1); err == nil {
-		t.Fatal("accepted more workers than CPUs")
-	}
 }
 
 func TestWorkerCount(t *testing.T) {

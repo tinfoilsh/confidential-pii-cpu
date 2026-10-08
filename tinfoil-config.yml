@@ -26,7 +26,6 @@ containers:
       - OPF_NUM_THREADS: "8"
       - OPF_MAX_CONCURRENCY: "1"
       - OPF_WORKERS: "4"
-      - OPF_PIN_WORKERS: "0"
       - OPF_MAX_INPUT_TOKENS: "8192"
       - OPF_MAX_QUEUE_DEPTH: "64"
     secrets:

@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -59,29 +58,6 @@ func workerCount() (int, error) {
 	return n, nil
 }
 
-// workerCPUBounds returns the inclusive CPU range for one worker when
-// OPF_PIN_WORKERS is enabled: the host's CPUs divided into equal contiguous
-// slices, one per worker. Pinning keeps each worker's spin-waiting torch/OpenMP
-// pool on its own cores so pools never steal cycles from each other.
-func workerCPUBounds(worker, workers int) (int, int, error) {
-	cpus := runtime.NumCPU()
-	per := cpus / workers
-	if per < 1 {
-		return 0, 0, fmt.Errorf("cannot pin %d workers across %d CPUs", workers, cpus)
-	}
-	start := worker * per
-	end := start + per - 1
-	if worker == workers-1 {
-		end = cpus - 1 // last worker absorbs the remainder
-	}
-	return start, end, nil
-}
-
-func pinWorkers() bool {
-	raw := strings.TrimSpace(os.Getenv("OPF_PIN_WORKERS"))
-	return raw == "1" || strings.EqualFold(raw, "true")
-}
-
 func run(ctx context.Context) error {
 	cfg, err := reportingConfig()
 	if err != nil {
@@ -105,7 +81,6 @@ func run(ctx context.Context) error {
 	unhealthy := make(chan error, workers)
 	targets := make([]*url.URL, workers)
 	backends := make([]*exec.Cmd, workers)
-	pin := pinWorkers()
 	for i := range workers {
 		port := strconv.Itoa(inferenceBasePort + i)
 		backendURL := "http://" + inferenceHost + ":" + port
@@ -121,23 +96,6 @@ func run(ctx context.Context) error {
 			return fmt.Errorf("start inference worker %d: %w", i, err)
 		}
 		backends[i] = backend
-		if pin {
-			// The mask is set before Python finishes booting, so every thread
-			// the interpreter spawns (including torch's pool at model load)
-			// inherits it.
-			start, end, err := workerCPUBounds(i, workers)
-			if err == nil {
-				err = pinToCPUs(backend.Process.Pid, start, end)
-			}
-			if err != nil {
-				stopBackend()
-				for _, started := range backends[:i+1] {
-					_ = started.Wait()
-				}
-				return fmt.Errorf("pinning worker %d: %w", i, err)
-			}
-			slog.Info("pinned inference worker", "worker", i, "cpus", fmt.Sprintf("%d-%d", start, end))
-		}
 		go func(worker int, cmd *exec.Cmd) {
 			err := cmd.Wait()
 			backendDone <- fmt.Errorf("inference worker %d exited unexpectedly: %v", worker, err)
