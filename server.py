@@ -84,7 +84,19 @@ def load_model():
     # Force eager weight loading — OPF() is lazy, so run a dummy redaction
     # to load tensors into memory before serving requests.
     _opf.redact("warmup")
-    _encoding = _opf.get_prediction_components()[0].encoding
+    runtime = _opf.get_prediction_components()[0]
+    # The checkpoint ships mixed bf16/fp32 tensors; on CPU every forward pass
+    # then pays thousands of per-layer dtype-conversion copies (profiled at
+    # ~56% of inference time). Converting the whole model once at load makes
+    # every pass single-dtype. Opt out with OPF_COMPUTE_DTYPE=checkpoint.
+    compute_dtype = os.environ.get("OPF_COMPUTE_DTYPE", "float32").lower()
+    if DEVICE == "cpu" and compute_dtype == "float32":
+        start = time.time()
+        runtime.model.float()
+        log.info("Converted model to float32 in %.1fs", time.time() - start)
+    elif compute_dtype not in ("checkpoint", "float32"):
+        raise ValueError(f"Unsupported OPF_COMPUTE_DTYPE: {compute_dtype!r}")
+    _encoding = runtime.encoding
     max_concurrency = int(os.environ.get("OPF_MAX_CONCURRENCY", "1"))
     _semaphore = asyncio.Semaphore(max_concurrency)
     MODEL_LOADED.set(1)
