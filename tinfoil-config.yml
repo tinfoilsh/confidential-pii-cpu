@@ -17,7 +17,7 @@ models:
 containers:
   - name: "privacy-filter"
     models: ["privacy-filter"]
-    image: "ghcr.io/tinfoilsh/confidential-pii-cpu@sha256:68b9ae91855d8020b83eb7362bd1632b5c053bc88611d55c4fcd745ca172c5f9"
+    image: "ghcr.io/tinfoilsh/confidential-pii-cpu@sha256:0a6b9232d2cdf6216f95231fee7b485ac997c5b14fb574994ef23d30ce91b1bf" # v0.3.1
     restart: always
     networks: [billing]
     env:
