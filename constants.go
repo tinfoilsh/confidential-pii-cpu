@@ -5,8 +5,8 @@ import "time"
 const (
 	listenAddress          = ":8001"
 	inferenceHost          = "127.0.0.1"
-	inferencePort          = "8002"
-	inferenceURL           = "http://" + inferenceHost + ":" + inferencePort
+	inferenceBasePort      = 8002
+	maxWorkers             = 8
 	controlplaneURL        = "https://api.tinfoil.sh"
 	reporterID             = "pii-filter"
 	redactPath             = "/redact"

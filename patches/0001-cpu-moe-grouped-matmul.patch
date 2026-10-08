@@ -1,0 +1,106 @@
+diff --git a/usr/local/lib/python3.12/site-packages/opf/_model/model.py b/usr/local/lib/python3.12/site-packages/opf/_model/model.py
+index 22b3d4c..66a2160 100644
+--- a/usr/local/lib/python3.12/site-packages/opf/_model/model.py
++++ b/usr/local/lib/python3.12/site-packages/opf/_model/model.py
+@@ -828,48 +828,63 @@ class MLPBlock(torch.nn.Module):
+                 out_accum.index_add_(0, token_ids_sorted, o.float())
+                 out_accum = out_accum * experts_per_token_eff
+                 return out_accum.to(x.dtype)
+-            # MLP #1
+-            mlp1_weight = self.mlp1_weight[expert_indices_chunk, ...]
+-            mlp1_bias = self.mlp1_bias[expert_indices_chunk, ...]
+-            mlp1_weight = mlp1_weight.float()
+-            mlp1_bias = mlp1_bias.float()
+-            t_expanded = (
+-                t_chunk.float()
+-                .unsqueeze(1)
+-                .expand(-1, expert_indices_chunk.shape[1], -1)
+-            )
+-            out = _batched_linear_with_parity(
+-                t_expanded,
+-                mlp1_weight,
+-                mlp1_bias,
+-            )
+-            out = swiglu(out, limit=self.swiglu_limit, packed=self.packed_geglu)
+-
+-            # MLP #2
+-            mlp2_weight = self.mlp2_weight[expert_indices_chunk, ...]
+-            mlp2_bias = self.mlp2_bias[expert_indices_chunk, ...]
+-            mlp2_weight = mlp2_weight.float()
+-            mlp2_bias = mlp2_bias.float()
+-            out = out.float()
+-            out = _batched_linear_with_parity(
+-                out,
+-                mlp2_weight,
+-                mlp2_bias,
++            # Torch fallback: the same group-by-expert algorithm as the
++            # Triton path, in plain torch. Tokens (small) are gathered and
++            # sorted by expert; each chosen expert's weights are read in
++            # place exactly once per call. The previous fallback gathered
++            # (copied) the selected experts' full weight matrices per token
++            # chunk — on CPU that memcpy dominated end-to-end latency ~6x
++            # over the matmuls it fed.
++            n_tokens = t_chunk.shape[0]
++            k = expert_indices_chunk.shape[1]
++            expert_ids = expert_indices_chunk.reshape(-1)
++            weights = expert_weights_chunk.reshape(-1).float()
++            token_ids = torch.arange(
++                n_tokens, device=t_chunk.device
++            ).repeat_interleave(k)
++            sort_idx = torch.argsort(expert_ids)
++            expert_ids_sorted = expert_ids[sort_idx]
++            token_ids_sorted = token_ids[sort_idx]
++            weights_sorted = weights[sort_idx]
++
++            counts = torch.bincount(expert_ids_sorted, minlength=self.num_experts)
++            x_sorted = t_chunk.float()[token_ids_sorted]
++            o = torch.empty(
++                (n_tokens * k, self.mlp2_weight.shape[-1]),
++                device=t_chunk.device,
++                dtype=torch.float32,
+             )
++            offset = 0
++            for expert in torch.nonzero(counts).flatten().tolist():
++                count = int(counts[expert])
++                rows = slice(offset, offset + count)
++                h = (
++                    x_sorted[rows] @ self.mlp1_weight[expert].float()
++                    + self.mlp1_bias[expert].float()
++                )
++                h = swiglu(h, limit=self.swiglu_limit, packed=self.packed_geglu)
++                o[rows] = (
++                    h @ self.mlp2_weight[expert].float()
++                    + self.mlp2_bias[expert].float()
++                )
++                offset += count
+             if self.world_size > 1:
+-                dist.all_reduce(out, op=dist.ReduceOp.SUM)
++                dist.all_reduce(o, op=dist.ReduceOp.SUM)
+ 
+             # Weighted sum of experts (gate scales applied after MLP2).
+-            if out.dtype != expert_weights_chunk.dtype:
+-                out = out.to(expert_weights_chunk.dtype)
+-            out = torch.einsum("bec,be->bc", out, expert_weights_chunk)
+-            out = out * experts_per_token_eff
+-            return out.to(x.dtype)
+-
+-        if use_triton:
+-            effective_batch = 0
+-        else:
+-            effective_batch = self.torch_ops_batch
++            out_accum = torch.zeros(
++                (n_tokens, o.shape[1]),
++                device=t_chunk.device,
++                dtype=torch.float32,
++            )
++            out_accum.index_add_(0, token_ids_sorted, o * weights_sorted[:, None])
++            out_accum = out_accum * experts_per_token_eff
++            return out_accum.to(x.dtype)
++
++        # Neither path gathers weight matrices any more, so peak memory no
++        # longer scales with the token-chunk size and chunking only adds
++        # per-chunk dispatch overhead.
++        effective_batch = 0
+         if effective_batch and t.shape[0] > effective_batch:
+             chunks = []
+             for start in range(0, t.shape[0], effective_batch):

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -42,8 +43,27 @@ func reportingConfig() (usageclient.Config, error) {
 	return usageclient.Config{Endpoint: endpoint.JoinPath(usage.IngestionPath).String(), ReporterID: reporterID, Secret: secret}, nil
 }
 
+// workerCount reads OPF_WORKERS. Each worker is a separate inference process
+// with its own interpreter and thread pool, so requests dispatched to
+// different workers do not contend on a shared lock or torch pool.
+func workerCount() (int, error) {
+	raw := strings.TrimSpace(os.Getenv("OPF_WORKERS"))
+	if raw == "" {
+		return 1, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 || n > maxWorkers {
+		return 0, fmt.Errorf("OPF_WORKERS must be an integer between 1 and %d (got %q)", maxWorkers, raw)
+	}
+	return n, nil
+}
+
 func run(ctx context.Context) error {
 	cfg, err := reportingConfig()
+	if err != nil {
+		return err
+	}
+	workers, err := workerCount()
 	if err != nil {
 		return err
 	}
@@ -53,33 +73,56 @@ func run(ctx context.Context) error {
 		defer cancel()
 		reporter.Stop(flushCtx)
 	}()
+
 	backendCtx, stopBackend := context.WithCancel(context.Background())
 	defer stopBackend()
-	backend := exec.CommandContext(backendCtx, "uvicorn", "server:app", "--host", inferenceHost, "--port", inferencePort, "--no-access-log")
-	backend.Stdout, backend.Stderr = os.Stdout, os.Stderr
-	backend.Cancel = func() error { return backend.Process.Signal(syscall.SIGTERM) }
-	backend.WaitDelay = shutdownTimeout
-	if err := backend.Start(); err != nil {
-		return fmt.Errorf("start inference: %w", err)
+
+	backendDone := make(chan error, workers)
+	unhealthy := make(chan error, workers)
+	targets := make([]*url.URL, workers)
+	backends := make([]*exec.Cmd, workers)
+	for i := range workers {
+		port := strconv.Itoa(inferenceBasePort + i)
+		backendURL := "http://" + inferenceHost + ":" + port
+		backend := exec.CommandContext(backendCtx, "uvicorn", "server:app", "--host", inferenceHost, "--port", port, "--no-access-log")
+		backend.Stdout, backend.Stderr = os.Stdout, os.Stderr
+		backend.Cancel = func() error { return backend.Process.Signal(syscall.SIGTERM) }
+		backend.WaitDelay = shutdownTimeout
+		if err := backend.Start(); err != nil {
+			stopBackend()
+			for _, started := range backends[:i] {
+				_ = started.Wait()
+			}
+			return fmt.Errorf("start inference worker %d: %w", i, err)
+		}
+		backends[i] = backend
+		go func(worker int, cmd *exec.Cmd) {
+			err := cmd.Wait()
+			backendDone <- fmt.Errorf("inference worker %d exited unexpectedly: %v", worker, err)
+		}(i, backend)
+		targets[i], _ = url.Parse(backendURL)
+		// Exiting on a wedged worker lets Docker's restart policy replace the
+		// whole set; an unhealthy state alone never triggers a restart.
+		go func(worker int, failed <-chan error) {
+			if err, ok := <-failed; ok {
+				unhealthy <- fmt.Errorf("inference worker %d unhealthy: %w", worker, err)
+			}
+		}(i, watchHealth(backendCtx, backendURL+healthPath, healthProbeInterval))
 	}
-	backendDone := make(chan error, 1)
-	go func() { backendDone <- backend.Wait() }()
-	target, _ := url.Parse(inferenceURL)
-	unhealthy := watchHealth(backendCtx, inferenceURL+healthPath, healthProbeInterval)
-	server := &http.Server{Addr: listenAddress, Handler: newGateway(target, reporter), ReadHeaderTimeout: headerTimeout, ReadTimeout: inferenceTimeout, IdleTimeout: inferenceTimeout}
+
+	server := &http.Server{Addr: listenAddress, Handler: newGateway(targets, reporter), ReadHeaderTimeout: headerTimeout, ReadTimeout: inferenceTimeout, IdleTimeout: inferenceTimeout}
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.ListenAndServe() }()
+
 	var result error
-	backendExited := false
+	backendsExited := 0
 	select {
 	case <-ctx.Done():
 	case err := <-backendDone:
-		backendExited = true
-		result = fmt.Errorf("inference exited unexpectedly: %v", err)
+		backendsExited = 1
+		result = err
 	case err := <-unhealthy:
-		// Exiting lets Docker's restart policy replace the wedged process;
-		// an unhealthy state alone never triggers a restart.
-		result = fmt.Errorf("inference unhealthy: %w", err)
+		result = err
 	case err := <-serverDone:
 		if !errors.Is(err, http.ErrServerClosed) {
 			result = err
@@ -92,7 +135,7 @@ func run(ctx context.Context) error {
 		result = errors.Join(result, err)
 	}
 	stopBackend()
-	if !backendExited {
+	for ; backendsExited < workers; backendsExited++ {
 		<-backendDone
 	}
 	return result

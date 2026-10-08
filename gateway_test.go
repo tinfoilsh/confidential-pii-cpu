@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -75,7 +76,7 @@ func TestGatewayOwnsBilling(t *testing.T) {
 			}))
 			defer backend.Close()
 			target, _ := url.Parse(backend.URL)
-			handler := newGateway(target, reporter)
+			handler := newGateway([]*url.URL{target}, reporter)
 			request := httptest.NewRequest(tc.method, tc.path, strings.NewReader(query))
 			if tc.auth != "" {
 				request.Header.Set("Authorization", tc.auth)
@@ -129,7 +130,7 @@ func TestGatewayBoundsAndRequestIdentity(t *testing.T) {
 	defer backend.Close()
 	target, _ := url.Parse(backend.URL)
 	reporter := &recordedUsage{}
-	handler := newGateway(target, reporter)
+	handler := newGateway([]*url.URL{target}, reporter)
 	oversized := httptest.NewRequest(http.MethodPost, redactPath, strings.NewReader(strings.Repeat("x", maxRequestBytes+1)))
 	oversized.Header.Set("Authorization", "Bearer tk_customer")
 	response := httptest.NewRecorder()
@@ -145,6 +146,72 @@ func TestGatewayBoundsAndRequestIdentity(t *testing.T) {
 	}
 	if len(reporter.events) != 2 || reporter.events[0].RequestID == reporter.events[1].RequestID {
 		t.Fatal("repeated requests collapsed into one charge")
+	}
+}
+
+// TestGatewayDispatchesConcurrentRequestsToIdleWorkers holds one worker busy
+// and checks that a second concurrent request lands on the other worker
+// instead of queueing behind the first.
+func TestGatewayDispatchesConcurrentRequestsToIdleWorkers(t *testing.T) {
+	release := make(chan struct{})
+	firstArrived := make(chan struct{})
+	var hits [2]atomic.Int64
+	makeBackend := func(i int, slow bool) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits[i].Add(1)
+			if slow {
+				close(firstArrived)
+				<-release
+			}
+			_, _ = io.WriteString(w, `{}`)
+		}))
+	}
+	slowBackend := makeBackend(0, true)
+	defer slowBackend.Close()
+	fastBackend := makeBackend(1, false)
+	defer fastBackend.Close()
+	slowURL, _ := url.Parse(slowBackend.URL)
+	fastURL, _ := url.Parse(fastBackend.URL)
+	handler := newGateway([]*url.URL{slowURL, fastURL}, &recordedUsage{})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	send := func() {
+		req, _ := http.NewRequest(http.MethodPost, server.URL+redactPath, strings.NewReader(`{"text":"hi"}`))
+		req.Header.Set("Authorization", "Bearer tk_customer")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		resp.Body.Close()
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); send() }()
+	<-firstArrived // worker 0 is now mid-request
+	send()         // must go to worker 1, not queue behind worker 0
+	if got := hits[1].Load(); got != 1 {
+		close(release)
+		t.Fatalf("second request did not reach the idle worker (hits: %d, %d)", hits[0].Load(), got)
+	}
+	close(release)
+	<-done
+}
+
+func TestWorkerCount(t *testing.T) {
+	t.Setenv("OPF_WORKERS", "")
+	if n, err := workerCount(); n != 1 || err != nil {
+		t.Fatalf("default workers: %d, %v", n, err)
+	}
+	t.Setenv("OPF_WORKERS", "2")
+	if n, err := workerCount(); n != 2 || err != nil {
+		t.Fatalf("workers: %d, %v", n, err)
+	}
+	for _, bad := range []string{"0", "-1", "9", "two"} {
+		t.Setenv("OPF_WORKERS", bad)
+		if _, err := workerCount(); err == nil {
+			t.Fatalf("accepted OPF_WORKERS=%q", bad)
+		}
 	}
 }
 
