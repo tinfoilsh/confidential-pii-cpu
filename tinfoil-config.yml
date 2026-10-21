@@ -1,5 +1,5 @@
 # Named model mounts under /tinfoil/models need cvmimage 0.12.0 or newer.
-cvm-version: 0.14.10
+cvm-version: 0.14.15
 # Four inference worker processes of 8 threads each (dispatched least-busy
 # by the gateway), so concurrent callers get separate processes instead of
 # queueing. A shared semaphore was measured to serialize them (each
