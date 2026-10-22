@@ -1,7 +1,7 @@
 # CPU image for the OpenAI Privacy Filter (opf) token-classification model.
 # Model weights are mounted as a verified modelwrap (MWP) read-only
 # filesystem at boot — no HuggingFace download or egress required.
-FROM golang:1.27.1 AS billing-build
+FROM golang:1.27.3@sha256:f20d83a83e18dbd2a4714b8ffd4b30b287b6243962dd75608e86abcc63ba4efc AS billing-build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
