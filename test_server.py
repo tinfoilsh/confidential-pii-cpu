@@ -131,6 +131,7 @@ def test_redact_in_process_stitches_windows_like_one_pass(stubbed):
 
     response = run(go())
     assert response.status_code == 200
+    assert response.headers[server.INPUT_TOKENS_HEADER] == str(n)
     assert response.json()["detected_spans"][0]["label"] == "test"
     (text, tokens, rows), = stubbed.calls
     assert tokens == list(range(n))
@@ -151,6 +152,7 @@ def test_redact_empty_text_runs_no_windows(stubbed):
     response = run(go())
     assert response.status_code == 200
     assert response.json()["detected_spans"] == []
+    assert response.headers[server.INPUT_TOKENS_HEADER] == "0"
     assert stubbed.calls == [("", [], [])]
 
 

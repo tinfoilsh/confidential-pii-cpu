@@ -51,6 +51,9 @@ WINDOW_OVERLAP = int(os.environ.get("OPF_WINDOW_OVERLAP", "128"))
 FORWARD_URL = os.environ.get("OPF_FORWARD_URL") or None
 FORWARD_TIMEOUT_SECONDS = float(os.environ.get("OPF_FORWARD_TIMEOUT", "120"))
 KEY_HASH_HEADER = "X-Tinfoil-Key-Hash"
+# Input token count returned to the gateway on every /redact response; the
+# gateway meters it on the usage event and strips it from the client response.
+INPUT_TOKENS_HEADER = "X-Tinfoil-Input-Tokens"
 
 _opf = None
 _runtime = None
@@ -81,6 +84,10 @@ SPANS_DETECTED = Counter(
 CHARS_PROCESSED = Counter(
     "pii_filter_chars_processed_total",
     "Total characters processed by the redact endpoint",
+)
+INPUT_TOKENS = Counter(
+    "pii_filter_input_tokens_total",
+    "Total input tokens processed by the redact endpoint",
 )
 WINDOWS_TOTAL = Counter(
     "pii_filter_windows_total",
@@ -282,7 +289,7 @@ async def forward(req: ForwardRequest):
 
 
 @app.post("/redact", response_model=RedactResponse)
-async def redact(req: RedactRequest, request: Request):
+async def redact(req: RedactRequest, request: Request, response: Response):
     REQUESTS_RUNNING.inc()
     start = time.time()
     status = "success"
@@ -306,6 +313,8 @@ async def redact(req: RedactRequest, request: Request):
         for span in result_dict.get("detected_spans", []):
             SPANS_DETECTED.labels(label=span.get("label", "unknown")).inc()
         CHARS_PROCESSED.inc(len(req.text))
+        INPUT_TOKENS.inc(len(tokens))
+        response.headers[INPUT_TOKENS_HEADER] = str(len(tokens))
         return result_dict
     except HTTPException as exc:
         status = "overloaded" if exc.status_code == 503 else "error"

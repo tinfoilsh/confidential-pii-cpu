@@ -71,6 +71,9 @@ func TestGatewayOwnsBilling(t *testing.T) {
 					}
 				}
 				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Path == redactPath {
+					w.Header().Set(inputTokensHeader, "7")
+				}
 				w.WriteHeader(tc.upstreamStatus)
 				_, _ = io.WriteString(w, responseBody)
 			}))
@@ -82,11 +85,15 @@ func TestGatewayOwnsBilling(t *testing.T) {
 				request.Header.Set("Authorization", tc.auth)
 			}
 			request.Header.Set(billableRequestsHeader, "0")
+			request.Header.Set(inputTokensHeader, "0")
 			request.Header.Set(usage.HeaderContext, "attacker-requests-free-inference")
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, request)
 			if response.Code != tc.wantStatus {
 				t.Fatalf("status %d, want %d", response.Code, tc.wantStatus)
+			}
+			if response.Header().Get(inputTokensHeader) != "" {
+				t.Fatal("input token count leaked to the client")
 			}
 			reporter.Flush(context.Background())
 			if tc.wantEvents == 0 {
@@ -112,6 +119,9 @@ func TestGatewayOwnsBilling(t *testing.T) {
 			if event.RequestID == "" || event.EventID == "" || response.Header().Get(billableRequestsHeader) != "1" {
 				t.Fatal("missing event identity or receipt")
 			}
+			if len(event.Meters) != 1 || event.Meters[0].Name != usage.MeterInputTokens || event.Meters[0].Quantity != 7 {
+				t.Fatalf("input tokens not metered: %+v", event.Meters)
+			}
 		})
 	}
 }
@@ -125,6 +135,7 @@ func TestGatewayBoundsAndRequestIdentity(t *testing.T) {
 	upstreamCalls := 0
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls++
+		w.Header().Set(inputTokensHeader, "1")
 		_, _ = io.WriteString(w, `{}`)
 	}))
 	defer backend.Close()
@@ -163,6 +174,7 @@ func TestGatewayDispatchesConcurrentRequestsToIdleWorkers(t *testing.T) {
 				close(firstArrived)
 				<-release
 			}
+			w.Header().Set(inputTokensHeader, "1")
 			_, _ = io.WriteString(w, `{}`)
 		}))
 	}
@@ -196,6 +208,25 @@ func TestGatewayDispatchesConcurrentRequestsToIdleWorkers(t *testing.T) {
 	}
 	close(release)
 	<-done
+}
+
+// A 200 without a token count cannot be metered; the gateway fails closed
+// instead of returning an unbilled result.
+func TestGatewayRefusesUnmeteredSuccess(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer backend.Close()
+	target, _ := url.Parse(backend.URL)
+	reporter := &recordedUsage{}
+	handler := newGateway([]*url.URL{target}, reporter, testLimits)
+	request := httptest.NewRequest(http.MethodPost, redactPath, strings.NewReader(`{"text":"hello"}`))
+	request.Header.Set("Authorization", "Bearer tk_customer")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadGateway || len(reporter.events) != 0 {
+		t.Fatalf("unmetered 200 passed through: status %d, events %d", response.Code, len(reporter.events))
+	}
 }
 
 func TestWorkerCount(t *testing.T) {

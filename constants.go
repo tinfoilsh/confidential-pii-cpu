@@ -17,7 +17,10 @@ const (
 	// keyHashHeader carries a hash of the caller's credential from the /redact
 	// proxy to the coordinating worker, which echoes it on every /forward it
 	// fans out, so the forward scheduler can queue windows per caller.
-	keyHashHeader           = "X-Tinfoil-Key-Hash"
+	keyHashHeader = "X-Tinfoil-Key-Hash"
+	// inputTokensHeader carries the request's input token count from the
+	// coordinator back to the gateway, which meters it and strips it.
+	inputTokensHeader       = "X-Tinfoil-Input-Tokens"
 	maxRequestBytes         = 4 << 20
 	defaultMaxConcurrency   = 1
 	defaultMaxQueuedWindows = 512

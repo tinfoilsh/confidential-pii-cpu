@@ -186,6 +186,7 @@ func TestRedactCarriesKeyHashToCoordinator(t *testing.T) {
 	var seen atomic.Value
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen.Store(r.Header.Get(keyHashHeader))
+		w.Header().Set(inputTokensHeader, "1")
 		_, _ = io.WriteString(w, `{}`)
 	}))
 	defer backend.Close()

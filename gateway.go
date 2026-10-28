@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,8 @@ import (
 	usage "github.com/tinfoilsh/usage-reporting-go"
 	usageclient "github.com/tinfoilsh/usage-reporting-go/client"
 )
+
+var errMissingInputTokens = errors.New("redact response carried no input token count")
 
 type eventReporter interface {
 	AddEvent(usage.Event)
@@ -71,9 +75,14 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 					r.Out.Header.Del(billableRequestsHeader)
 					r.Out.Header.Del("Accept-Encoding")
 					r.Out.Header.Del(keyHashHeader)
+					r.Out.Header.Del(inputTokensHeader)
 				},
 				ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-					slog.Error("privacy filter upstream unavailable")
+					// Also reached when a 200 carried no token count: fail closed
+					// rather than return a result we cannot meter.
+					if !errors.Is(err, errMissingInputTokens) {
+						slog.Error("privacy filter upstream unavailable")
+					}
 					http.Error(w, "privacy filter unavailable", http.StatusBadGateway)
 				},
 			},
@@ -111,12 +120,22 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 		}
 		requestProxy.ModifyResponse = func(resp *http.Response) error {
 			resp.Header.Del(billableRequestsHeader)
+			// The coordinator reports the input token count it tokenized; it
+			// rides on the usage event as an input_tokens meter (one billable
+			// request as before) and never reaches the client.
+			inputTokens, err := strconv.ParseInt(resp.Header.Get(inputTokensHeader), 10, 64)
+			resp.Header.Del(inputTokensHeader)
 			if resp.StatusCode == http.StatusOK {
+				if err != nil || inputTokens < 0 {
+					slog.Error("redact response carried no input token count")
+					return errMissingInputTokens
+				}
 				reporter.AddEvent(usage.Event{
 					RequestID:        uuid.NewString(),
 					APIKey:           parts[1],
 					Operation:        usage.Operation{Service: usage.ServicePIIFilter, Name: usage.OperationPIIFilterRedact},
 					CustomerRequests: 1,
+					Meters:           []usage.Meter{{Name: usage.MeterInputTokens, Quantity: inputTokens}},
 				})
 				resp.Header.Set(billableRequestsHeader, "1")
 			}
