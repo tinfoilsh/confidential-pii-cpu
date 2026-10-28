@@ -27,14 +27,15 @@ def text_of(n):
 CLASSES = 2
 
 
-def fake_rows(tokens):
-    """Row i is [token, position-in-window]: the second column makes a row
-    depend on where the window was cut, like a truncated attention band."""
-    return [[float(tok), float(i)] for i, tok in enumerate(tokens)]
+def fake_rows(tokens, position_offset=0):
+    """Row i is [token, absolute position]: the second column records the
+    position the window was run at, so a stitched result equals a single
+    pass only if every window was given its true offset."""
+    return [[float(tok), float(position_offset + i)] for i, tok in enumerate(tokens)]
 
 
-def fake_forward(tokens):
-    rows = fake_rows(tokens)
+def fake_forward(tokens, position_offset=0):
+    rows = fake_rows(tokens, position_offset)
     return struct.pack(f"<{len(rows) * CLASSES}f", *(v for r in rows for v in r)), CLASSES
 
 
@@ -125,12 +126,12 @@ def test_forward_lane_is_serialized_by_the_semaphore(stubbed, monkeypatch):
     peak = []
     release = threading.Event()
 
-    def blocking_forward(tokens):
+    def blocking_forward(tokens, position_offset=0):
         running.append(1)
         peak.append(len(running))
         release.wait(timeout=5)
         running.pop()
-        return fake_forward(tokens)
+        return fake_forward(tokens, position_offset)
 
     monkeypatch.setattr(server, "forward_tokens", blocking_forward)
 
@@ -162,12 +163,9 @@ def test_redact_in_process_stitches_windows_like_one_pass(stubbed):
     assert response.json()["detected_spans"][0]["label"] == "test"
     (text, tokens, rows), = stubbed.calls
     assert tokens == list(range(n))
-    # The kept rows are the ones each token would get with a full-width
-    # window on both sides; the position column is window-relative.
-    expected = []
-    for plan in plans:
-        expected.extend(fake_rows(tokens[plan.start : plan.end])[plan.keep_start - plan.start : plan.keep_end - plan.start])
-    assert rows == expected
+    # Every window ran at its absolute offset, so the stitched rows are
+    # exactly what one pass over the whole sequence would produce.
+    assert rows == fake_rows(tokens)
     assert [r[0] for r in rows] == [float(t) for t in tokens]
 
 

@@ -72,6 +72,13 @@ REQUEST_TOKENS_HEADER = "X-Tinfoil-Request-Tokens"
 # /forward speaks raw native little-endian int32 / float32; the shape of the
 # returned score matrix travels in this header as "rows,classes".
 SHAPE_HEADER = "X-Tinfoil-Shape"
+# A window's absolute token offset, sent on each /forward. The worker runs
+# the window at its true positions so the rotary angles are bit-for-bit
+# those of an unchunked pass; without it every window would restart at
+# position 0 and differ from the single-pass result by float32 angle
+# rounding (measured ~1e-2 in log-probability — the same size as prepending
+# one token to the document, but not zero).
+POSITION_OFFSET_HEADER = "X-Tinfoil-Position-Offset"
 OCTET_STREAM = "application/octet-stream"
 if sys.byteorder != "little" or array("i").itemsize != 4:
     raise RuntimeError("forward protocol assumes little-endian 4-byte ints")
@@ -172,6 +179,7 @@ def load_model():
     elif compute_dtype not in ("checkpoint", "float32"):
         raise ValueError(f"Unsupported OPF_COMPUTE_DTYPE: {compute_dtype!r}")
     _encoding = _runtime.encoding
+    _init_rotary_offsets(_runtime.model)
     max_concurrency = int(os.environ.get("OPF_MAX_CONCURRENCY", "1"))
     _semaphore = asyncio.Semaphore(max_concurrency)
     if FORWARD_URL is not None:
@@ -223,12 +231,46 @@ class RedactResponse(BaseModel):
     warning: str | None = None
 
 
-def forward_tokens(tokens: Sequence[int]) -> tuple[bytes, int]:
+_rotary_modules: list = []
+
+
+def _init_rotary_offsets(model) -> None:
+    """Keep every rotary module's full cos/sin tables so a window can be run
+    at an absolute position offset (see POSITION_OFFSET_HEADER)."""
+    global _rotary_modules
+    _rotary_modules = [m for m in model.modules() if type(m).__name__ == "RotaryEmbedding"]
+    for rope in _rotary_modules:
+        rope._tinfoil_cos_full = rope.cos_cache
+        rope._tinfoil_sin_full = rope.sin_cache
+    log.info("Rotary position offsets enabled on %d module(s)", len(_rotary_modules))
+
+
+def _set_rotary_offset(offset: int, length: int) -> None:
+    """Point the rotary caches at rows [offset, offset+length). opf slices
+    `cos_cache[:num_tokens]`, so a view starting at `offset` yields the
+    true absolute positions. The caller holds the forward semaphore, so
+    the module state is not shared with another forward."""
+    for rope in _rotary_modules:
+        full_cos, full_sin = rope._tinfoil_cos_full, rope._tinfoil_sin_full
+        if offset + length > full_cos.shape[0]:
+            cos, sin = rope._compute_cos_sin(offset + length, device=full_cos.device)
+            rope._tinfoil_cos_full, rope._tinfoil_sin_full = cos, sin
+            full_cos, full_sin = cos, sin
+        rope.cos_cache = full_cos[offset:]
+        rope.sin_cache = full_sin[offset:]
+
+
+def forward_tokens(tokens: Sequence[int], position_offset: int = 0) -> tuple[bytes, int]:
     """One model forward: the window's per-token class log-probabilities as
-    raw float32 bytes (row-major, native little-endian) plus the class count."""
+    raw float32 bytes (row-major, native little-endian) plus the class count.
+    `position_offset` is the window's absolute token index in its request."""
     from opf._core.runtime import forward_window
 
-    scores = forward_window(_runtime, tokens).contiguous()
+    _set_rotary_offset(position_offset, len(tokens))
+    try:
+        scores = forward_window(_runtime, tokens).contiguous()
+    finally:
+        _set_rotary_offset(0, 0)
     return scores.numpy().tobytes(), int(scores.shape[1])
 
 
@@ -278,14 +320,20 @@ def scores_view(payload: bytes, rows: int, classes: int) -> memoryview:
 
 
 async def run_window(
-    tokens: list[int], key_hash: str, request_tokens: int, fanout: asyncio.Semaphore
+    tokens: list[int],
+    key_hash: str,
+    request_tokens: int,
+    fanout: asyncio.Semaphore,
+    position_offset: int = 0,
 ) -> memoryview:
     """Score one window: on this process, or via the gateway's fair queue."""
     start = time.time()
     try:
         if FORWARD_URL is None:
             async with _semaphore:
-                payload, classes = await run_in_threadpool(forward_tokens, tokens)
+                payload, classes = await run_in_threadpool(
+                    forward_tokens, tokens, position_offset
+                )
             return scores_view(payload, len(tokens), classes)
         try:
             async with fanout:
@@ -296,6 +344,7 @@ async def run_window(
                         "Content-Type": OCTET_STREAM,
                         KEY_HASH_HEADER: key_hash,
                         REQUEST_TOKENS_HEADER: str(request_tokens),
+                        POSITION_OFFSET_HEADER: str(position_offset),
                     },
                 )
         except httpx.HTTPError as exc:
@@ -346,11 +395,17 @@ async def forward(request: Request):
         raise HTTPException(status_code=422, detail="tokens must be non-empty int32 bytes")
     tokens = array("i")
     tokens.frombytes(body)
+    try:
+        position_offset = int(request.headers.get(POSITION_OFFSET_HEADER, "0"))
+        if position_offset < 0:
+            raise ValueError
+    except ValueError:
+        raise HTTPException(status_code=422, detail="invalid position offset") from None
     async with _semaphore:
         FORWARDS_RUNNING.inc()
         start = time.time()
         try:
-            payload, classes = await run_in_threadpool(forward_tokens, tokens)
+            payload, classes = await run_in_threadpool(forward_tokens, tokens, position_offset)
         finally:
             FORWARD_DURATION.observe(time.time() - start)
             FORWARDS_RUNNING.dec()
@@ -378,7 +433,13 @@ async def redact(req: RedactRequest, request: Request, response: Response):
             async with asyncio.TaskGroup() as group:
                 tasks = [
                     group.create_task(
-                        run_window(tokens[plan.start : plan.end], key_hash, len(tokens), fanout)
+                        run_window(
+                            tokens[plan.start : plan.end],
+                            key_hash,
+                            len(tokens),
+                            fanout,
+                            position_offset=plan.start,
+                        )
                     )
                     for plan in plans
                 ]

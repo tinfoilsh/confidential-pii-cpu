@@ -24,6 +24,10 @@ const (
 	// requestTokensHeader carries the owning request's total token count on
 	// each /forward so the scheduler can tell short requests from long ones.
 	requestTokensHeader = "X-Tinfoil-Request-Tokens"
+	// positionOffsetHeader carries a window's absolute token offset on each
+	// /forward, relayed to the worker so the window runs at its true
+	// positions (bit-for-bit the same rotary angles as an unchunked pass).
+	positionOffsetHeader = "X-Tinfoil-Position-Offset"
 	// forwardShapeHeader is the worker's "rows,classes" shape of a /forward
 	// response body, relayed to the coordinator untouched.
 	forwardShapeHeader      = "X-Tinfoil-Shape"

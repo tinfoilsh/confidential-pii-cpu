@@ -196,6 +196,11 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 			return
 		}
 		req.Header.Set("Content-Type", r.Header.Get("Content-Type"))
+		// The window's absolute token offset: the worker runs the window at
+		// its true positions so rotary angles match an unchunked pass exactly.
+		if offset := r.Header.Get(positionOffsetHeader); offset != "" {
+			req.Header.Set(positionOffsetHeader, offset)
+		}
 		resp, err := forwardClient.Do(req)
 		if err != nil {
 			if errors.Is(forwardCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
