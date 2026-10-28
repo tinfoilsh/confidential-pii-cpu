@@ -269,7 +269,7 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 			stats := reporter.Stats()
 			fs := scheduler.stats()
 			suffix := fmt.Sprintf("\npii_usage_enqueued_total %d\npii_usage_delivered_total %d\npii_usage_failed_total %d\npii_usage_dropped_total %d\npii_forward_queued %d\npii_forward_inflight %d\npii_forward_timeouts_total %d\npii_forward_hold_seconds_total %.3f\npii_forward_ms_per_token %.4f\n",
-				stats.Enqueued, stats.DeliveredEvents, stats.FailedEvents, stats.DroppedDisabled+stats.DroppedBufferFull, fs.queued, fs.inflight, forwardTimeouts.Load(), fs.holdSeconds, fs.msPerToken)
+				stats.Enqueued, stats.DeliveredEvents, stats.FailedEvents, stats.DroppedDisabled+stats.DroppedBufferFull, fs.queued, fs.inflight, forwardTimeouts.Load(), fs.holdSeconds, fs.msPerToken) + fs.shortWaitMetrics()
 			resp.Body = &appendedBody{Reader: io.MultiReader(resp.Body, strings.NewReader(suffix)), Closer: resp.Body}
 			resp.ContentLength = -1
 			resp.Header.Del("Content-Length")

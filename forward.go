@@ -4,8 +4,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -58,11 +60,19 @@ type lane struct {
 // forwardItem is one window waiting for a lane. ready receives the lane it
 // was assigned; the sender never blocks because the channel holds one.
 type forwardItem struct {
-	key    string
-	tokens int
-	short  bool
-	ready  chan *lane
+	key        string
+	tokens     int
+	short      bool
+	ready      chan *lane
+	enqueuedAt time.Time
 }
+
+// shortWaitBuckets are the upper bounds (seconds) of the short-window
+// queue-wait histogram exported on /metrics: how long a short request's
+// window sat in the queue before a lane took it. This is the number the
+// hold rule is meant to bound, separated from everything else in a
+// request's latency.
+var shortWaitBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10}
 
 // forwardScheduler hands windows to lanes. Short requests' windows are
 // served first, FIFO. Long requests each have a FIFO queue keyed by the
@@ -89,8 +99,13 @@ type forwardScheduler struct {
 	holdSince   time.Time
 	holdLanes   int
 	holdSeconds float64
-	holdTimer   *time.Timer
-	now         func() time.Time
+	// short-window queue wait histogram (see shortWaitBuckets): counts per
+	// bucket (cumulative, Prometheus style), total count and sum.
+	shortWaitCounts [9]int64
+	shortWaitSum    float64
+	shortWaitCount  int64
+	holdTimer       *time.Timer
+	now             func() time.Time
 }
 
 func newForwardScheduler(workers []*worker, limits forwardLimits) *forwardScheduler {
@@ -123,7 +138,7 @@ func (s *forwardScheduler) enqueue(key string, tokens int, short bool) (*forward
 	if s.queued >= s.limits.maxQueued {
 		return nil, errForwardQueueFull
 	}
-	item := &forwardItem{key: key, tokens: tokens, short: short, ready: make(chan *lane, 1)}
+	item := &forwardItem{key: key, tokens: tokens, short: short, ready: make(chan *lane, 1), enqueuedAt: s.now()}
 	if short {
 		s.lastShort = s.now()
 		s.short = append(s.short, item)
@@ -196,13 +211,39 @@ type forwardStats struct {
 	queued, inflight int
 	holdSeconds      float64
 	msPerToken       float64
+	shortWaitCounts  [9]int64
+	shortWaitSum     float64
+	shortWaitCount   int64
+}
+
+func (s *forwardScheduler) observeShortWaitLocked(seconds float64) {
+	for i, upper := range shortWaitBuckets {
+		if seconds <= upper {
+			s.shortWaitCounts[i]++
+		}
+	}
+	s.shortWaitCounts[len(shortWaitBuckets)]++ // +Inf
+	s.shortWaitSum += seconds
+	s.shortWaitCount++
+}
+
+// shortWaitMetrics renders the histogram in Prometheus text format.
+func (fs forwardStats) shortWaitMetrics() string {
+	var b strings.Builder
+	for i, upper := range shortWaitBuckets {
+		fmt.Fprintf(&b, "pii_forward_short_wait_seconds_bucket{le=\"%g\"} %d\n", upper, fs.shortWaitCounts[i])
+	}
+	fmt.Fprintf(&b, "pii_forward_short_wait_seconds_bucket{le=\"+Inf\"} %d\n", fs.shortWaitCounts[len(shortWaitBuckets)])
+	fmt.Fprintf(&b, "pii_forward_short_wait_seconds_sum %.4f\npii_forward_short_wait_seconds_count %d\n", fs.shortWaitSum, fs.shortWaitCount)
+	return b.String()
 }
 
 func (s *forwardScheduler) stats() forwardStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.settleHoldLocked()
-	return forwardStats{queued: s.queued, inflight: s.inflight, holdSeconds: s.holdSeconds, msPerToken: s.msPerToken}
+	return forwardStats{queued: s.queued, inflight: s.inflight, holdSeconds: s.holdSeconds, msPerToken: s.msPerToken,
+		shortWaitCounts: s.shortWaitCounts, shortWaitSum: s.shortWaitSum, shortWaitCount: s.shortWaitCount}
 }
 
 // settleHoldLocked books the idle lane-seconds accrued since the hold began.
@@ -238,6 +279,9 @@ func (s *forwardScheduler) dispatchLocked() {
 		pop()
 		s.queued--
 		s.inflight++
+		if item.short {
+			s.observeShortWaitLocked(s.now().Sub(item.enqueuedAt).Seconds())
+		}
 		l.busy, l.start, l.tokens = true, s.now(), item.tokens
 		l.worker.forwards++
 		item.ready <- l
