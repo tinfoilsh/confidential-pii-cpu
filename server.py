@@ -17,6 +17,7 @@ Each process plays two roles:
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -37,18 +38,19 @@ from prometheus_client import (
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
-from chunking import kept_outputs, plan_windows
+from chunking import check_geometry, kept_outputs, plan_windows, required_overlap
 
 log = logging.getLogger("privacy-filter")
 logging.basicConfig(level=logging.INFO)
 
 CHECKPOINT_DIR = os.environ.get("OPF_CHECKPOINT", "/tinfoil/models/privacy-filter/original")
 DEVICE = os.environ.get("OPF_DEVICE", "cpu")
-# Windows of WINDOW_TOKENS tokens overlapping by 2 x WINDOW_OVERLAP; the
-# overlap must be at least the model's attention band (128) so every kept
-# token sees the same neighbours it would in one long forward pass.
-WINDOW_TOKENS = int(os.environ.get("OPF_WINDOW_TOKENS", "1024"))
-WINDOW_OVERLAP = int(os.environ.get("OPF_WINDOW_OVERLAP", "128"))
+# Windows of WINDOW_TOKENS tokens overlapping by 2 x WINDOW_OVERLAP. The
+# overlap must cover the model's receptive field (layers x attention
+# context, 1024 for the pinned checkpoint; enforced at load from the
+# checkpoint config) so every kept token's scores equal a single long pass.
+WINDOW_TOKENS = int(os.environ.get("OPF_WINDOW_TOKENS", "6144"))
+WINDOW_OVERLAP = int(os.environ.get("OPF_WINDOW_OVERLAP", "1024"))
 # The gateway's forward dispatcher. Unset means run windows in this process.
 FORWARD_URL = os.environ.get("OPF_FORWARD_URL") or None
 # A window may wait in the gateway queue for up to the request ceiling.
@@ -64,6 +66,9 @@ KEY_HASH_HEADER = "X-Tinfoil-Key-Hash"
 # Input token count returned to the gateway on every /redact response; the
 # gateway meters it on the usage event and strips it from the client response.
 INPUT_TOKENS_HEADER = "X-Tinfoil-Input-Tokens"
+# Total tokens of the owning request, sent on each /forward so the gateway
+# can prioritise short requests.
+REQUEST_TOKENS_HEADER = "X-Tinfoil-Request-Tokens"
 # /forward speaks raw native little-endian int32 / float32; the shape of the
 # returned score matrix travels in this header as "rows,classes".
 SHAPE_HEADER = "X-Tinfoil-Shape"
@@ -101,9 +106,11 @@ CHARS_PROCESSED = Counter(
     "pii_filter_chars_processed_total",
     "Total characters processed by the redact endpoint",
 )
-INPUT_TOKENS = Counter(
-    "pii_filter_input_tokens_total",
-    "Total input tokens processed by the redact endpoint",
+# A histogram: _sum is the total tokens processed, _bucket the traffic shape.
+INPUT_TOKENS = Histogram(
+    "pii_filter_input_tokens",
+    "Input tokens per redact request",
+    buckets=[128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
 )
 WINDOWS_TOTAL = Counter(
     "pii_filter_windows_total",
@@ -141,7 +148,12 @@ def load_model():
 
     from opf import OPF
 
-    plan_windows(0, WINDOW_TOKENS, WINDOW_OVERLAP)  # validate the geometry early
+    with open(os.path.join(CHECKPOINT_DIR, "config.json"), encoding="utf-8") as handle:
+        required = required_overlap(json.load(handle))
+    check_geometry(WINDOW_TOKENS, WINDOW_OVERLAP, required)
+    log.info(
+        "Window geometry %d/%d (receptive field %d)", WINDOW_TOKENS, WINDOW_OVERLAP, required
+    )
     log.info("Loading model from %s (threads=%d)", CHECKPOINT_DIR, n_threads)
     _opf = OPF(model=CHECKPOINT_DIR, device=DEVICE)
     # Force eager weight loading — OPF() is lazy, so run a dummy redaction
@@ -265,7 +277,9 @@ def scores_view(payload: bytes, rows: int, classes: int) -> memoryview:
     return memoryview(payload).cast("f", shape=(rows, classes))
 
 
-async def run_window(tokens: list[int], key_hash: str, fanout: asyncio.Semaphore) -> memoryview:
+async def run_window(
+    tokens: list[int], key_hash: str, request_tokens: int, fanout: asyncio.Semaphore
+) -> memoryview:
     """Score one window: on this process, or via the gateway's fair queue."""
     start = time.time()
     try:
@@ -278,7 +292,11 @@ async def run_window(tokens: list[int], key_hash: str, fanout: asyncio.Semaphore
                 response = await _forward_client.post(
                     FORWARD_URL,
                     content=array("i", tokens).tobytes(),
-                    headers={"Content-Type": OCTET_STREAM, KEY_HASH_HEADER: key_hash},
+                    headers={
+                        "Content-Type": OCTET_STREAM,
+                        KEY_HASH_HEADER: key_hash,
+                        REQUEST_TOKENS_HEADER: str(request_tokens),
+                    },
                 )
         except httpx.HTTPError as exc:
             FORWARD_FAILURES.labels(status="transport").inc()
@@ -359,7 +377,9 @@ async def redact(req: RedactRequest, request: Request, response: Response):
             # refused window does not leave the rest burning worker time.
             async with asyncio.TaskGroup() as group:
                 tasks = [
-                    group.create_task(run_window(tokens[plan.start : plan.end], key_hash, fanout))
+                    group.create_task(
+                        run_window(tokens[plan.start : plan.end], key_hash, len(tokens), fanout)
+                    )
                     for plan in plans
                 ]
         except* HTTPException as failures:
@@ -373,7 +393,7 @@ async def redact(req: RedactRequest, request: Request, response: Response):
         for span in result_dict.get("detected_spans", []):
             SPANS_DETECTED.labels(label=span.get("label", "unknown")).inc()
         CHARS_PROCESSED.inc(len(req.text))
-        INPUT_TOKENS.inc(len(tokens))
+        INPUT_TOKENS.observe(len(tokens))
         response.headers[INPUT_TOKENS_HEADER] = str(len(tokens))
         return result_dict
     except HTTPException as exc:

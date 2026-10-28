@@ -197,7 +197,13 @@ def remote(stubbed, monkeypatch):
         tokens = array("i")
         tokens.frombytes(request.content)
         tokens = list(tokens)
-        seen.append((request.headers.get(server.KEY_HASH_HEADER), tokens))
+        seen.append(
+            (
+                request.headers.get(server.KEY_HASH_HEADER),
+                tokens,
+                request.headers.get(server.REQUEST_TOKENS_HEADER),
+            )
+        )
         ordinal = len(seen)
         seen.in_flight += 1
         seen.peak = max(seen.peak, seen.in_flight)
@@ -238,8 +244,9 @@ def test_redact_fans_windows_out_through_the_gateway(stubbed, remote):
     assert response.status_code == 200
     assert len(remote) == len(plans)
     assert remote.peak == server.FORWARD_FANOUT  # bounded, but saturated
-    assert {key for key, _ in remote} == {"caller-hash"}
-    assert sorted(tokens[0] for _, tokens in remote) == [p.start for p in plans]
+    assert {key for key, _, _ in remote} == {"caller-hash"}
+    assert {req_tokens for _, _, req_tokens in remote} == {str(n)}
+    assert sorted(tokens[0] for _, tokens, _ in remote) == [p.start for p in plans]
     (_, tokens, rows), = stubbed.calls
     assert [r[0] for r in rows] == [float(t) for t in tokens]
 
