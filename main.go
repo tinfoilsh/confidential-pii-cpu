@@ -119,7 +119,7 @@ func forwardLimitsFromEnv(workers int) (forwardLimits, error) {
 	if limits.horizons, err = secondsListEnv("OPF_SHORT_LANE_HORIZONS", defaultShortLaneHorizon); err != nil {
 		return forwardLimits{}, err
 	}
-	armed, err := secondsEnv("OPF_SHORT_LANE_ARMED_SECONDS", 0)
+	armed, err := secondsEnv("OPF_SHORT_LANE_ARMED_SECONDS", defaultShortLaneArmed)
 	if err != nil {
 		return forwardLimits{}, err
 	}

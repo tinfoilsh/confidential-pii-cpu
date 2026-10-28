@@ -113,7 +113,7 @@ func newForwardScheduler(workers []*worker, limits forwardLimits) *forwardSchedu
 		limits.maxInflight = 1
 	}
 	if limits.msPerToken <= 0 {
-		limits.msPerToken = 0.8
+		limits.msPerToken = defaultMsPerToken
 	}
 	s := &forwardScheduler{
 		workers:    workers,

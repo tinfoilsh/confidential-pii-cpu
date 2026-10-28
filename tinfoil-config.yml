@@ -46,9 +46,9 @@ containers:
       # first; long windows are held when the k-th soonest-freeing other
       # lane is not predicted free within horizon k ("" or "0" disables).
       # ARMED_SECONDS > 0 applies the rule only after recent short traffic.
-      - OPF_SHORT_LANE_HORIZONS: "1.5,3.0"
-      - OPF_SHORT_LANE_ARMED_SECONDS: "0"
-      - OPF_MS_PER_TOKEN: "0.8"
+      - OPF_SHORT_LANE_HORIZONS: "0.5,1.5"
+      - OPF_SHORT_LANE_ARMED_SECONDS: "30"
+      - OPF_MS_PER_TOKEN: "0.5"
     secrets:
       - METRICS_API_KEY
       - USAGE_REPORTER_SECRET

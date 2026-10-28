@@ -52,10 +52,14 @@ const (
 	// (8 × 128 = 1024 for the pinned checkpoint), so the overlap must be at
 	// least that for chunked scores to equal one long pass. The workers
 	// enforce the floor from the checkpoint config at startup.
-	defaultWindowTokens     = 6144
-	defaultWindowOverlap    = 1024
-	defaultShortLaneHorizon = "1.5,3.0"
-	defaultMsPerToken       = 0.8
+	defaultWindowTokens  = 6144
+	defaultWindowOverlap = 1024
+	// Lab-measured on TDX (tf-test benchmarks/safeguards/opf/chunking):
+	// horizons 0.5,1.5 keep prod-shaped short calls under ~1 s p99 behind a
+	// 50k-token document at no document cost; 0.5 ms/token at 4 × 8 threads.
+	defaultShortLaneHorizon = "0.5,1.5"
+	defaultShortLaneArmed   = 30 * time.Second
+	defaultMsPerToken       = 0.5
 	shutdownTimeout         = 30 * time.Second
 	reportFlushTimeout      = 10 * time.Second
 	healthProbeInterval     = 30 * time.Second
