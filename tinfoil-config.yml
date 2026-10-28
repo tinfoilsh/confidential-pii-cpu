@@ -26,8 +26,12 @@ containers:
       - OPF_NUM_THREADS: "8"
       - OPF_MAX_CONCURRENCY: "1"
       - OPF_WORKERS: "4"
-      - OPF_MAX_INPUT_TOKENS: "8192"
-      - OPF_MAX_QUEUE_DEPTH: "64"
+      # Long inputs are cut into overlapping windows that the gateway's
+      # /forward queue spreads across every worker, fairly per caller.
+      - OPF_WINDOW_TOKENS: "1024"
+      - OPF_WINDOW_OVERLAP: "128"
+      - OPF_FORWARD_URL: "http://127.0.0.1:8001/forward"
+      - OPF_MAX_QUEUED_WINDOWS: "512"
     secrets:
       - METRICS_API_KEY
       - USAGE_REPORTER_SECRET

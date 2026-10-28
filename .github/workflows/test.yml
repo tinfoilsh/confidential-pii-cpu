@@ -26,4 +26,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements-test.txt
-      - run: python -m pytest test_server.py
+      - run: python -m pytest test_server.py test_chunking.py

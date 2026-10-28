@@ -14,7 +14,7 @@ Run the tests without model weights:
 
 ```bash
 go test -race ./...
-pip install -r requirements-test.txt && python -m pytest test_server.py
+pip install -r requirements-test.txt && python -m pytest test_server.py test_chunking.py
 ```
 
 Run locally after installing `requirements.txt` and a CPU build of torch; the front end starts the Python inference server itself:
@@ -26,7 +26,7 @@ export USAGE_REPORTER_SECRET="your-usage-reporter-secret"
 go run .
 ```
 
-Limits, health checks, and usage reporting are described in [DEPLOYMENT.md](DEPLOYMENT.md).
+Long inputs are cut into overlapping windows that the Go gateway's internal `/forward` queue spreads across every worker process, fairly per caller; see [DEPLOYMENT.md](DEPLOYMENT.md) for the window geometry, limits, health checks, and usage reporting. Upstream `opf` changes are carried as [patches](patches/README.md) applied at image build.
 
 ## Reporting Vulnerabilities
 
