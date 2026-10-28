@@ -2,28 +2,37 @@
 whose output for a token depends on exactly its ±R-token neighbourhood, so a
 window that truncates a kept token's context produces a different row."""
 
-import hashlib
 import struct
 
 import pytest
 
-from chunking import assemble, kept_outputs, plan_windows
+from chunking import assemble, check_geometry, kept_outputs, plan_windows, required_overlap
 
+# Production defaults: 8 layers × 128 context = 1024-token receptive field.
+RECEPTIVE_FIELD = 8 * 128
+W_DEFAULT, OVERLAP_DEFAULT = 6144, 1024
 W = 1024
 
 
 def fake_forward(tokens, reach):
-    """Each row is a hash of the token's ±`reach` neighbourhood (clipped to the
-    window), mimicking a banded model whose attention reaches `reach` tokens
-    each way. Relative positions only, like RoPE: shifting the window does
-    not change a row unless its neighbourhood is clipped."""
+    """Each row summarises the token's ±`reach` neighbourhood (clipped to the
+    window): how far the band extends left, its length, its sum and a
+    position-weighted sum, so any clipping or reordering changes the row.
+    Relative positions only, like RoPE: shifting the window does not change
+    a row unless its neighbourhood is clipped. O(n) via prefix sums."""
+    n = len(tokens)
+    prefix = [0] * (n + 1)
+    weighted = [0] * (n + 1)
+    for i, tok in enumerate(tokens):
+        prefix[i + 1] = prefix[i] + tok
+        weighted[i + 1] = weighted[i] + (i + 1) * tok
     rows = []
-    for i in range(len(tokens)):
-        band = tokens[max(0, i - reach) : i + reach + 1]
-        digest = hashlib.blake2b(
-            f"{i - max(0, i - reach)}|{band}".encode(), digest_size=8
-        ).digest()
-        rows.append([int.from_bytes(digest, "big") / 2**64, float(len(band))])
+    for i in range(n):
+        lo, hi = max(0, i - reach), min(n, i + reach + 1)
+        band_sum = prefix[hi] - prefix[lo]
+        # position-weighted sum relative to the token, independent of window offset
+        rel = (weighted[hi] - weighted[lo]) - (i + 1) * band_sum
+        rows.append([float(i - lo), float(hi - lo), float(band_sum), float(rel)])
     return rows
 
 
@@ -75,30 +84,67 @@ def test_chunked_equals_single_window_for_model_reaching_overlap(length, W, over
     assert assemble(plans, outputs, n) == fake_forward(tokens, overlap)
 
 
-def test_differential_test_is_sensitive_to_truncated_context():
+@pytest.mark.parametrize("n", [1, W_DEFAULT, W_DEFAULT + 1, 3 * W_DEFAULT, 10 * W_DEFAULT + 7])
+def test_defaults_are_exact_for_the_models_receptive_field(n):
+    """At the production geometry a model with the checkpoint's receptive
+    field (8 layers × 128) scores every token identically to one long pass."""
+    tokens = tokens_of(n)
+    plans = plan_windows(n, W_DEFAULT, OVERLAP_DEFAULT)
+    outputs = [fake_forward(tokens[p.start : p.end], RECEPTIVE_FIELD) for p in plans]
+    assert assemble(plans, outputs, n) == fake_forward(tokens, RECEPTIVE_FIELD)
+    assert all(p.length <= W_DEFAULT for p in plans)
+    if n > W_DEFAULT:
+        assert plans[1].start - plans[0].start == W_DEFAULT - 2 * OVERLAP_DEFAULT  # stride 4096
+
+
+@pytest.mark.parametrize("W,overlap", [(W_DEFAULT, OVERLAP_DEFAULT), (W, 128)])
+def test_differential_test_is_sensitive_to_truncated_context(W, overlap):
     """A model reaching one token further than the overlap must see the seams:
     proves the equality above is not vacuous."""
-    n, overlap = 10 * W + 7, 128
+    n = 10 * W + 7
     tokens = tokens_of(n)
     plans = plan_windows(n, W, overlap)
     outputs = [fake_forward(tokens[p.start : p.end], overlap + 1) for p in plans]
     assert assemble(plans, outputs, n) != fake_forward(tokens, overlap + 1)
 
 
+def test_required_overlap_from_checkpoint_config():
+    config = {
+        "num_hidden_layers": 8,
+        "bidirectional_left_context": 128,
+        "bidirectional_right_context": 128,
+    }
+    assert required_overlap(config) == RECEPTIVE_FIELD
+    assert required_overlap({**config, "bidirectional_right_context": 64}) == 8 * 128
+    assert required_overlap({**config, "num_hidden_layers": 36}) == 36 * 128
+    with pytest.raises(KeyError):
+        required_overlap({"num_hidden_layers": 8})
+
+
+def test_geometry_floor_refuses_inexact_overlap():
+    check_geometry(W_DEFAULT, OVERLAP_DEFAULT, RECEPTIVE_FIELD)
+    check_geometry(W_DEFAULT, 2048, RECEPTIVE_FIELD)  # env may raise it
+    with pytest.raises(ValueError, match="receptive field"):
+        check_geometry(W_DEFAULT, 1023, RECEPTIVE_FIELD)
+    with pytest.raises(ValueError, match="twice the overlap"):
+        check_geometry(2048, OVERLAP_DEFAULT, RECEPTIVE_FIELD)
+
+
 def test_kept_outputs_slices_binary_rows_exactly():
     """The server stitches float32 bytes without decoding: a 2-D memoryview
     over each window's bytes slices by row and the kept slices concatenate
     to the single-pass bytes."""
-    n, overlap, classes = 3 * W + 5, 128, 3
+    n, overlap = 3 * W + 5, 128
     tokens = tokens_of(n)
     plans = plan_windows(n, W, overlap)
+    classes = len(fake_forward([1], overlap)[0])
 
     def forward_bytes(window):
         rows = fake_forward(window, overlap)
-        return struct.pack(f"<{len(rows) * classes}f", *(v for r in rows for v in (r + [0.0])))
+        return struct.pack(f"<{len(rows) * classes}d", *(v for r in rows for v in r))
 
     outputs = [
-        memoryview(forward_bytes(tokens[p.start : p.end])).cast("f", shape=(p.length, classes))
+        memoryview(forward_bytes(tokens[p.start : p.end])).cast("d", shape=(p.length, classes))
         for p in plans
     ]
     stitched = b"".join(part.tobytes() for part in kept_outputs(plans, outputs, n))

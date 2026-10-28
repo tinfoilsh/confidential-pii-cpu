@@ -1,14 +1,17 @@
 """Overlapping-window planning for long inputs.
 
-The privacy filter is a banded-attention token classifier: each layer lets a
-token attend to its ±128 neighbours (see the model card), and the Viterbi
-decode that turns per-token scores into spans runs over the whole sequence.
+The privacy filter is a banded-attention token classifier: each of its
+layers lets a token attend to its ±`context` neighbours, so after `layers`
+layers a token's scores depend on ±`layers × context` tokens (its receptive
+field; 8 × 128 = 1024 for the pinned checkpoint), and the Viterbi decode
+that turns per-token scores into spans runs over the whole sequence.
 Upstream `opf` cuts long inputs into non-overlapping `n_ctx` windows, so
-tokens near each cut lose half their context. This module plans windows of
-`window` tokens that overlap by `overlap`, keeps only the tokens of each
-window that have `overlap` tokens of context on both sides (except at the
-sequence start and end, where the context genuinely ends), and stitches the
-kept rows back into one per-token sequence.
+tokens near each cut lose context. This module plans windows of `window`
+tokens that overlap by `overlap`, keeps only the tokens of each window that
+have `overlap` tokens of context on both sides (except at the sequence
+start and end, where the context genuinely ends), and stitches the kept
+rows back into one per-token sequence. With `overlap` ≥ the receptive
+field, the stitched scores equal one long forward pass exactly.
 
 Every token is kept from exactly one window, so upstream's cross-window
 aggregation (logaddexp of duplicates, divided by count) reduces to the
@@ -47,6 +50,29 @@ class WindowPlan:
                 f"window {self.start}:{self.end} produced {len(rows)} rows, expected {self.length}"
             )
         return rows[self.keep_start - self.start : self.keep_end - self.start]
+
+
+def required_overlap(checkpoint_config: dict) -> int:
+    """The model's receptive field from its config: layers × the wider of the
+    left/right attention contexts. The overlap must be at least this."""
+    layers = int(checkpoint_config["num_hidden_layers"])
+    context = max(
+        int(checkpoint_config["bidirectional_left_context"]),
+        int(checkpoint_config["bidirectional_right_context"]),
+    )
+    if layers <= 0 or context < 0:
+        raise ValueError("checkpoint config has no usable layer/context counts")
+    return layers * context
+
+
+def check_geometry(window: int, overlap: int, required: int) -> None:
+    """Refuse a geometry that would make chunking inexact or impossible."""
+    if overlap < required:
+        raise ValueError(
+            f"OPF_WINDOW_OVERLAP={overlap} is below the model's receptive field "
+            f"({required} tokens); chunked scores would not match a single pass"
+        )
+    plan_windows(0, window, overlap)  # window > 2 × overlap
 
 
 def plan_windows(n_tokens: int, window: int, overlap: int) -> list[WindowPlan]:
