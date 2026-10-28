@@ -58,12 +58,44 @@ func workerCount() (int, error) {
 	return n, nil
 }
 
+// positiveEnv reads an integer environment variable that must be at least 1.
+func positiveEnv(name string, fallback int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%s must be a positive integer (got %q)", name, raw)
+	}
+	return n, nil
+}
+
+// forwardLimitsFromEnv sizes the forward scheduler: workers × the per-worker
+// OPF_MAX_CONCURRENCY lanes may run at once, and OPF_MAX_QUEUED_WINDOWS
+// windows may wait for one.
+func forwardLimitsFromEnv(workers int) (forwardLimits, error) {
+	concurrency, err := positiveEnv("OPF_MAX_CONCURRENCY", defaultMaxConcurrency)
+	if err != nil {
+		return forwardLimits{}, err
+	}
+	queued, err := positiveEnv("OPF_MAX_QUEUED_WINDOWS", defaultMaxQueuedWindows)
+	if err != nil {
+		return forwardLimits{}, err
+	}
+	return forwardLimits{maxInflight: workers * concurrency, maxQueued: queued}, nil
+}
+
 func run(ctx context.Context) error {
 	cfg, err := reportingConfig()
 	if err != nil {
 		return err
 	}
 	workers, err := workerCount()
+	if err != nil {
+		return err
+	}
+	limits, err := forwardLimitsFromEnv(workers)
 	if err != nil {
 		return err
 	}
@@ -110,7 +142,7 @@ func run(ctx context.Context) error {
 		}(i, watchHealth(backendCtx, backendURL+healthPath, healthProbeInterval))
 	}
 
-	server := &http.Server{Addr: listenAddress, Handler: newGateway(targets, reporter), ReadHeaderTimeout: headerTimeout, ReadTimeout: inferenceTimeout, IdleTimeout: inferenceTimeout}
+	server := &http.Server{Addr: listenAddress, Handler: newGateway(targets, reporter, limits), ReadHeaderTimeout: headerTimeout, ReadTimeout: inferenceTimeout, IdleTimeout: inferenceTimeout}
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.ListenAndServe() }()
 

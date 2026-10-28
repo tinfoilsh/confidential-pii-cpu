@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	usage "github.com/tinfoilsh/usage-reporting-go"
@@ -30,7 +31,8 @@ type eventReporter interface {
 type worker struct {
 	target   *url.URL
 	proxy    *httputil.ReverseProxy
-	inflight atomic.Int64
+	inflight atomic.Int64 // /redact requests being coordinated
+	forwards int          // model forwards running; guarded by forwardScheduler.mu
 }
 
 func pickWorker(workers []*worker) *worker {
@@ -45,7 +47,13 @@ func pickWorker(workers []*worker) *worker {
 
 // The shim authenticates the bearer credential before this handler is reached.
 // The inference servers are private; only this handler emits billing events.
-func newGateway(targets []*url.URL, reporter eventReporter) http.Handler {
+//
+// A /redact request is coordinated by one worker, which tokenizes, cuts the
+// input into overlapping windows and posts each window back to this
+// gateway's /forward. The forward scheduler queues windows per caller and
+// runs them on whichever worker has a free lane, so long documents use every
+// worker and short requests from other callers interleave with them.
+func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits) http.Handler {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = inferenceTimeout
 	transport.DisableCompression = true
@@ -62,6 +70,7 @@ func newGateway(targets []*url.URL, reporter eventReporter) http.Handler {
 					r.Out.Header.Del(usage.HeaderUsageContextSignature)
 					r.Out.Header.Del(billableRequestsHeader)
 					r.Out.Header.Del("Accept-Encoding")
+					r.Out.Header.Del(keyHashHeader)
 				},
 				ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 					slog.Error("privacy filter upstream unavailable")
@@ -72,6 +81,8 @@ func newGateway(targets []*url.URL, reporter eventReporter) http.Handler {
 	}
 
 	healthClient := &http.Client{Transport: transport, Timeout: healthProbeTimeout}
+	forwardClient := &http.Client{Transport: transport}
+	scheduler := newForwardScheduler(workers, limits)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+redactPath, func(w http.ResponseWriter, r *http.Request) {
@@ -93,6 +104,11 @@ func newGateway(targets []*url.URL, reporter eventReporter) http.Handler {
 		picked.inflight.Add(1)
 		defer picked.inflight.Add(-1)
 		requestProxy := *picked.proxy
+		baseRewrite, hash := picked.proxy.Rewrite, keyHash(parts[1])
+		requestProxy.Rewrite = func(pr *httputil.ProxyRequest) {
+			baseRewrite(pr)
+			pr.Out.Header.Set(keyHashHeader, hash)
+		}
 		requestProxy.ModifyResponse = func(resp *http.Response) error {
 			resp.Header.Del(billableRequestsHeader)
 			if resp.StatusCode == http.StatusOK {
@@ -107,6 +123,57 @@ func newGateway(targets []*url.URL, reporter eventReporter) http.Handler {
 			return nil
 		}
 		requestProxy.ServeHTTP(w, r.WithContext(ctx))
+	})
+	// Internal: one model forward over one window. Reached only from the
+	// coordinating workers on this host; the shim never exposes it.
+	mux.HandleFunc("POST "+forwardPath, func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopback(r.RemoteAddr) {
+			http.Error(w, "forward is internal", http.StatusForbidden)
+			return
+		}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+		if err != nil {
+			http.Error(w, "invalid or oversized request body", http.StatusRequestEntityTooLarge)
+			return
+		}
+		item, err := scheduler.enqueue(r.Header.Get(keyHashHeader))
+		if err != nil {
+			http.Error(w, "privacy filter is at capacity", http.StatusServiceUnavailable)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), inferenceTimeout)
+		defer cancel()
+		var picked *worker
+		select {
+		case picked = <-item.ready:
+		case <-ctx.Done():
+			if !scheduler.cancel(item) {
+				scheduler.release(<-item.ready)
+			}
+			http.Error(w, "privacy filter is at capacity", http.StatusServiceUnavailable)
+			return
+		}
+		defer scheduler.release(picked)
+		start := time.Now()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, picked.target.String()+forwardPath, bytes.NewReader(body))
+		if err != nil {
+			http.Error(w, "privacy filter unavailable", http.StatusBadGateway)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := forwardClient.Do(req)
+		if err != nil {
+			slog.Error("forward upstream unavailable", "error", err)
+			http.Error(w, "privacy filter unavailable", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			slog.Warn("forward failed", "status", resp.StatusCode, "elapsed", time.Since(start))
+		}
+		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
 	})
 	// Healthy means every worker is healthy: a single wedged worker must fail
 	// the container's healthcheck (and the boot gate) even while its siblings
@@ -144,8 +211,9 @@ func newGateway(targets []*url.URL, reporter eventReporter) http.Handler {
 				return nil
 			}
 			stats := reporter.Stats()
-			suffix := fmt.Sprintf("\npii_usage_enqueued_total %d\npii_usage_delivered_total %d\npii_usage_failed_total %d\npii_usage_dropped_total %d\n",
-				stats.Enqueued, stats.DeliveredEvents, stats.FailedEvents, stats.DroppedDisabled+stats.DroppedBufferFull)
+			queued, inflight := scheduler.stats()
+			suffix := fmt.Sprintf("\npii_usage_enqueued_total %d\npii_usage_delivered_total %d\npii_usage_failed_total %d\npii_usage_dropped_total %d\npii_forward_queued %d\npii_forward_inflight %d\n",
+				stats.Enqueued, stats.DeliveredEvents, stats.FailedEvents, stats.DroppedDisabled+stats.DroppedBufferFull, queued, inflight)
 			resp.Body = &appendedBody{Reader: io.MultiReader(resp.Body, strings.NewReader(suffix)), Closer: resp.Body}
 			resp.ContentLength = -1
 			resp.Header.Del("Content-Length")

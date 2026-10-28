@@ -76,7 +76,7 @@ func TestGatewayOwnsBilling(t *testing.T) {
 			}))
 			defer backend.Close()
 			target, _ := url.Parse(backend.URL)
-			handler := newGateway([]*url.URL{target}, reporter)
+			handler := newGateway([]*url.URL{target}, reporter, testLimits)
 			request := httptest.NewRequest(tc.method, tc.path, strings.NewReader(query))
 			if tc.auth != "" {
 				request.Header.Set("Authorization", tc.auth)
@@ -130,7 +130,7 @@ func TestGatewayBoundsAndRequestIdentity(t *testing.T) {
 	defer backend.Close()
 	target, _ := url.Parse(backend.URL)
 	reporter := &recordedUsage{}
-	handler := newGateway([]*url.URL{target}, reporter)
+	handler := newGateway([]*url.URL{target}, reporter, testLimits)
 	oversized := httptest.NewRequest(http.MethodPost, redactPath, strings.NewReader(strings.Repeat("x", maxRequestBytes+1)))
 	oversized.Header.Set("Authorization", "Bearer tk_customer")
 	response := httptest.NewRecorder()
@@ -172,7 +172,7 @@ func TestGatewayDispatchesConcurrentRequestsToIdleWorkers(t *testing.T) {
 	defer fastBackend.Close()
 	slowURL, _ := url.Parse(slowBackend.URL)
 	fastURL, _ := url.Parse(fastBackend.URL)
-	handler := newGateway([]*url.URL{slowURL, fastURL}, &recordedUsage{})
+	handler := newGateway([]*url.URL{slowURL, fastURL}, &recordedUsage{}, testLimits)
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
