@@ -11,3 +11,10 @@ Dockerfile after `pip install`.
   Measured: 99x on a 600-token forward pass, max logit diff 1e-5.
   Proposed upstream to openai/privacy-filter; drop this patch and bump the
   requirements.txt pin once merged.
+- `0002-runtime-expose-forward-and-decode-stages.patch` — splits
+  `opf/_core/runtime.py::predict_text` into reusable stages (`encode_text`,
+  `forward_window`, `decode_token_scores`) with no behaviour change, so
+  `server.py` can run the window forwards elsewhere (the gateway's fair
+  queue across workers) and feed the stitched scores to the unchanged global
+  decode. Regenerate with `git diff` against the pristine tarball with
+  0001 applied.
