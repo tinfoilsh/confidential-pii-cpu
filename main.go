@@ -144,6 +144,15 @@ func floatEnv(name string, fallback float64) (float64, error) {
 }
 
 // secondsEnv reads a non-negative duration in seconds.
+// forwardURLForWorkers is the /forward endpoint handed to spawned workers:
+// OPF_FORWARD_URL when the deployment sets it, else this gateway's own.
+func forwardURLForWorkers() string {
+	if raw := strings.TrimSpace(os.Getenv("OPF_FORWARD_URL")); raw != "" {
+		return raw
+	}
+	return "http://" + inferenceHost + listenAddress + forwardPath
+}
+
 func secondsEnv(name string, fallback time.Duration) (time.Duration, error) {
 	raw := strings.TrimSpace(os.Getenv(name))
 	if raw == "" {
@@ -215,6 +224,10 @@ func run(ctx context.Context) error {
 		backendURL := "http://" + inferenceHost + ":" + port
 		backend := exec.CommandContext(backendCtx, "uvicorn", "server:app", "--host", inferenceHost, "--port", port, "--no-access-log", "--timeout-keep-alive", strconv.Itoa(int(workerKeepAlive.Seconds())))
 		backend.Stdout, backend.Stderr = os.Stdout, os.Stderr
+		// Workers post their windows to this gateway's /forward unless the
+		// deployment points them elsewhere (unset in the worker means
+		// in-process, single-worker development).
+		backend.Env = append(os.Environ(), "OPF_FORWARD_URL="+forwardURLForWorkers())
 		backend.Cancel = func() error { return backend.Process.Signal(syscall.SIGTERM) }
 		backend.WaitDelay = shutdownTimeout
 		if err := backend.Start(); err != nil {

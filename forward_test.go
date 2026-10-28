@@ -484,3 +484,14 @@ func TestForwardLimitsFromEnv(t *testing.T) {
 		}
 	}
 }
+
+func TestForwardURLForWorkersDefaultsToGateway(t *testing.T) {
+	t.Setenv("OPF_FORWARD_URL", "")
+	if got := forwardURLForWorkers(); got != "http://127.0.0.1:8001/forward" {
+		t.Fatalf("default forward url: %q", got)
+	}
+	t.Setenv("OPF_FORWARD_URL", "http://127.0.0.1:9999/forward")
+	if got := forwardURLForWorkers(); got != "http://127.0.0.1:9999/forward" {
+		t.Fatalf("override forward url: %q", got)
+	}
+}

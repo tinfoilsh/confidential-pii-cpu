@@ -30,21 +30,14 @@ containers:
       # model's receptive field), so chunked output equals one long pass.
       - OPF_WINDOW_TOKENS: "6144"
       - OPF_WINDOW_OVERLAP: "1024"
-      # Windows go through the gateway's fair queue across all workers.
-      - OPF_FORWARD_URL: "http://127.0.0.1:8001/forward"
       # 503 only when the queue cannot drain; a 4 MiB request is ~250 windows.
       - OPF_MAX_QUEUED_WINDOWS: "4096"
-      # Size allowances per window / per request; FORWARD_TIMEOUT is the
-      # wedge detector (worker marked unhealthy).
-      - OPF_WINDOW_TIMEOUT_SECONDS: "5"
-      - OPF_MAX_REQUEST_SECONDS: "900"
+      # Wedge detector: a window exceeding this marks its worker unhealthy.
       - OPF_FORWARD_TIMEOUT_SECONDS: "30"
       # Short requests go first; a long window waits if no lane would be
-      # free for a short one within 0.5 s / 1.5 s. Active for 30 s after
-      # short traffic; MS_PER_TOKEN seeds the lane-ETA estimate.
+      # free for a short one within 0.5 s / 1.5 s. Other scheduler knobs
+      # (see DEPLOYMENT.md) keep their lab-measured defaults.
       - OPF_SHORT_LANE_HORIZONS: "0.5,1.5"
-      - OPF_SHORT_LANE_ARMED_SECONDS: "30"
-      - OPF_MS_PER_TOKEN: "0.5"
     secrets:
       - METRICS_API_KEY
       - USAGE_REPORTER_SECRET
