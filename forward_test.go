@@ -446,7 +446,7 @@ func TestForwardLimitsFromEnv(t *testing.T) {
 	}
 	os.Unsetenv("OPF_SHORT_LANE_HORIZONS")
 	limits, err := forwardLimitsFromEnv(4)
-	want := forwardLimits{maxInflight: 4, maxQueued: defaultMaxQueuedWindows, windowTokens: 6144, windowOverlap: 1024, windowTimeout: 5 * time.Second, maxRequest: 15 * time.Minute, forwardTimeout: 30 * time.Second, shortTokens: 6144, horizons: []time.Duration{1500 * time.Millisecond, 3 * time.Second}, msPerToken: 0.8}
+	want := forwardLimits{maxInflight: 4, maxQueued: defaultMaxQueuedWindows, windowTokens: 6144, windowOverlap: 1024, windowTimeout: 5 * time.Second, maxRequest: 15 * time.Minute, forwardTimeout: 30 * time.Second, shortTokens: 6144, horizons: []time.Duration{500 * time.Millisecond, 1500 * time.Millisecond}, armed: 30 * time.Second, msPerToken: 0.5}
 	if err != nil || fmt.Sprint(limits) != fmt.Sprint(want) {
 		t.Fatalf("defaults: %+v, %v", limits, err)
 	}

@@ -43,7 +43,9 @@ from chunking import check_geometry, kept_outputs, plan_windows, required_overla
 log = logging.getLogger("privacy-filter")
 logging.basicConfig(level=logging.INFO)
 
-CHECKPOINT_DIR = os.environ.get("OPF_CHECKPOINT", "/tinfoil/models/privacy-filter/original")
+CHECKPOINT_DIR = os.environ.get(
+    "OPF_CHECKPOINT", "/tinfoil/models/privacy-filter/original"
+)
 DEVICE = os.environ.get("OPF_DEVICE", "cpu")
 # Windows of WINDOW_TOKENS tokens overlapping by 2 x WINDOW_OVERLAP. The
 # overlap must cover the model's receptive field (layers x attention
@@ -60,7 +62,9 @@ FORWARD_TIMEOUT_SECONDS = float(os.environ.get("OPF_MAX_REQUEST_SECONDS", "900")
 # request from opening 250 sockets. Default: twice the forward lanes.
 FORWARD_FANOUT = int(
     os.environ.get("OPF_FORWARD_FANOUT")
-    or 2 * int(os.environ.get("OPF_WORKERS", "1")) * int(os.environ.get("OPF_MAX_CONCURRENCY", "1"))
+    or 2
+    * int(os.environ.get("OPF_WORKERS", "1"))
+    * int(os.environ.get("OPF_MAX_CONCURRENCY", "1"))
 )
 KEY_HASH_HEADER = "X-Tinfoil-Key-Hash"
 # Input token count returned to the gateway on every /redact response; the
@@ -159,7 +163,10 @@ def load_model():
         required = required_overlap(json.load(handle))
     check_geometry(WINDOW_TOKENS, WINDOW_OVERLAP, required)
     log.info(
-        "Window geometry %d/%d (receptive field %d)", WINDOW_TOKENS, WINDOW_OVERLAP, required
+        "Window geometry %d/%d (receptive field %d)",
+        WINDOW_TOKENS,
+        WINDOW_OVERLAP,
+        required,
     )
     log.info("Loading model from %s (threads=%d)", CHECKPOINT_DIR, n_threads)
     _opf = OPF(model=CHECKPOINT_DIR, device=DEVICE)
@@ -238,7 +245,9 @@ def _init_rotary_offsets(model) -> None:
     """Keep every rotary module's full cos/sin tables so a window can be run
     at an absolute position offset (see POSITION_OFFSET_HEADER)."""
     global _rotary_modules
-    _rotary_modules = [m for m in model.modules() if type(m).__name__ == "RotaryEmbedding"]
+    _rotary_modules = [
+        m for m in model.modules() if type(m).__name__ == "RotaryEmbedding"
+    ]
     for rope in _rotary_modules:
         rope._tinfoil_cos_full = rope.cos_cache
         rope._tinfoil_sin_full = rope.sin_cache
@@ -260,7 +269,9 @@ def _set_rotary_offset(offset: int, length: int) -> None:
         rope.sin_cache = full_sin[offset:]
 
 
-def forward_tokens(tokens: Sequence[int], position_offset: int = 0) -> tuple[bytes, int]:
+def forward_tokens(
+    tokens: Sequence[int], position_offset: int = 0
+) -> tuple[bytes, int]:
     """One model forward: the window's per-token class log-probabilities as
     raw float32 bytes (row-major, native little-endian) plus the class count.
     `position_offset` is the window's absolute token index in its request."""
@@ -356,19 +367,30 @@ async def run_window(
             except httpx.HTTPError as exc:
                 FORWARD_FAILURES.labels(status="transport").inc()
                 last_error = f"forward dispatch failed: {type(exc).__name__}: {exc}"
-                log.warning("window @%d (%d tokens) attempt %d: %s", position_offset, len(tokens), attempt + 1, last_error)
+                log.warning(
+                    "window @%d (%d tokens) attempt %d: %s",
+                    position_offset,
+                    len(tokens),
+                    attempt + 1,
+                    last_error,
+                )
                 continue
             if response.status_code != 200:
                 FORWARD_FAILURES.labels(status=str(response.status_code)).inc()
                 if response.status_code == 503:
-                    raise HTTPException(status_code=503, detail="privacy filter is at capacity")
+                    raise HTTPException(
+                        status_code=503, detail="privacy filter is at capacity"
+                    )
                 # Includes 504: a forward exceeded the gateway's per-window
                 # deadline. The whole request fails; nothing partial is returned.
                 raise HTTPException(
-                    status_code=502, detail=f"forward failed with status {response.status_code}"
+                    status_code=502,
+                    detail=f"forward failed with status {response.status_code}",
                 )
             try:
-                rows, classes = (int(v) for v in response.headers[SHAPE_HEADER].split(","))
+                rows, classes = (
+                    int(v) for v in response.headers[SHAPE_HEADER].split(",")
+                )
                 if rows != len(tokens):
                     raise ValueError(f"{rows} rows for {len(tokens)} tokens")
                 return scores_view(response.content, rows, classes)
@@ -379,7 +401,13 @@ async def run_window(
                     f"(status {response.status_code}, {len(response.content)} bytes, "
                     f"shape={response.headers.get(SHAPE_HEADER)!r})"
                 )
-                log.warning("window @%d (%d tokens) attempt %d: %s", position_offset, len(tokens), attempt + 1, last_error)
+                log.warning(
+                    "window @%d (%d tokens) attempt %d: %s",
+                    position_offset,
+                    len(tokens),
+                    attempt + 1,
+                    last_error,
+                )
         FORWARD_FAILURES.labels(status="gave_up").inc()
         raise HTTPException(status_code=502, detail=last_error or "forward failed")
     finally:
@@ -408,7 +436,9 @@ async def forward(request: Request):
     """
     body = await request.body()
     if not body or len(body) % 4:
-        raise HTTPException(status_code=422, detail="tokens must be non-empty int32 bytes")
+        raise HTTPException(
+            status_code=422, detail="tokens must be non-empty int32 bytes"
+        )
     tokens = array("i")
     tokens.frombytes(body)
     try:
@@ -421,7 +451,9 @@ async def forward(request: Request):
         FORWARDS_RUNNING.inc()
         start = time.time()
         try:
-            payload, classes = await run_in_threadpool(forward_tokens, tokens, position_offset)
+            payload, classes = await run_in_threadpool(
+                forward_tokens, tokens, position_offset
+            )
         finally:
             FORWARD_DURATION.observe(time.time() - start)
             FORWARDS_RUNNING.dec()
@@ -464,8 +496,12 @@ async def redact(req: RedactRequest, request: Request, response: Response):
         outputs = [task.result() for task in tasks]
         classes = outputs[0].shape[1] if outputs else 0
         if any(out.shape[1] != classes for out in outputs):
-            raise HTTPException(status_code=502, detail="windows disagree on class count")
-        scores = b"".join(part.tobytes() for part in kept_outputs(plans, outputs, len(tokens)))
+            raise HTTPException(
+                status_code=502, detail="windows disagree on class count"
+            )
+        scores = b"".join(
+            part.tobytes() for part in kept_outputs(plans, outputs, len(tokens))
+        )
         result_dict = await run_in_threadpool(finish, req.text, tokens, scores, classes)
         for span in result_dict.get("detected_spans", []):
             SPANS_DETECTED.labels(label=span.get("label", "unknown")).inc()
