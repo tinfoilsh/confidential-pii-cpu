@@ -30,8 +30,11 @@ const (
 	positionOffsetHeader = "X-Tinfoil-Position-Offset"
 	// forwardShapeHeader is the worker's "rows,classes" shape of a /forward
 	// response body, relayed to the coordinator untouched.
-	forwardShapeHeader      = "X-Tinfoil-Shape"
-	maxRequestBytes         = 4 << 20
+	forwardShapeHeader = "X-Tinfoil-Shape"
+	maxRequestBytes    = 4 << 20
+	// rateSampleMinTokens: only forwards at least this long update the
+	// ms-per-token estimate behind lane ETAs (see forwardScheduler.release).
+	rateSampleMinTokens     = 1024
 	defaultMaxConcurrency   = 1
 	defaultMaxQueuedWindows = 4096
 	headerTimeout           = 10 * time.Second

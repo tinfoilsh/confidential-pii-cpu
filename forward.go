@@ -176,7 +176,12 @@ func (s *forwardScheduler) cancel(item *forwardItem) bool {
 func (s *forwardScheduler) release(l *lane, completed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if completed && l.tokens > 0 {
+	// Learn the per-token rate only from windows large enough that the
+	// forward's fixed overhead is negligible: a 30-token chat call measures
+	// ~4 ms/token against ~0.4 for a full window, and one such sample every
+	// half second would inflate every lane's ETA 10x and make the hold rule
+	// hold constantly (measured: ~50% lane idle under a doc burst).
+	if completed && l.tokens >= rateSampleMinTokens {
 		observed := float64(s.now().Sub(l.start).Milliseconds()) / float64(l.tokens)
 		s.msPerToken = 0.8*s.msPerToken + 0.2*observed
 	}
