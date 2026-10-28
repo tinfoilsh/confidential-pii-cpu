@@ -65,6 +65,7 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = limits.maxRequest
 	transport.DisableCompression = true
+	transport.IdleConnTimeout = workerIdleConnTimeout
 	workers := make([]*worker, len(targets))
 	for i, target := range targets {
 		workers[i] = &worker{
@@ -85,7 +86,7 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 					// Also reached when a 200 carried no token count: fail closed
 					// rather than return a result we cannot meter.
 					if !errors.Is(err, errMissingInputTokens) {
-						slog.Error("privacy filter upstream unavailable")
+						slog.Error("privacy filter upstream unavailable", "error", err, "worker", r.URL.Host)
 					}
 					http.Error(w, "privacy filter unavailable", http.StatusBadGateway)
 				},

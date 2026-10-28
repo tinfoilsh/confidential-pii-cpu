@@ -213,7 +213,7 @@ func run(ctx context.Context) error {
 	for i := range workers {
 		port := strconv.Itoa(inferenceBasePort + i)
 		backendURL := "http://" + inferenceHost + ":" + port
-		backend := exec.CommandContext(backendCtx, "uvicorn", "server:app", "--host", inferenceHost, "--port", port, "--no-access-log")
+		backend := exec.CommandContext(backendCtx, "uvicorn", "server:app", "--host", inferenceHost, "--port", port, "--no-access-log", "--timeout-keep-alive", strconv.Itoa(int(workerKeepAlive.Seconds())))
 		backend.Stdout, backend.Stderr = os.Stdout, os.Stderr
 		backend.Cancel = func() error { return backend.Process.Signal(syscall.SIGTERM) }
 		backend.WaitDelay = shutdownTimeout

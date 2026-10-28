@@ -264,3 +264,11 @@ func TestReportingConfigFailsClosed(t *testing.T) {
 		t.Fatalf("config: %+v, %v", cfg, err)
 	}
 }
+
+// The gateway must drop idle worker connections before uvicorn does, or a
+// reused connection races the worker's close and a POST fails with EOF.
+func TestWorkerKeepAliveOutlivesGatewayIdle(t *testing.T) {
+	if workerIdleConnTimeout*2 > workerKeepAlive {
+		t.Fatalf("gateway idle %v must be well under worker keep-alive %v", workerIdleConnTimeout, workerKeepAlive)
+	}
+}

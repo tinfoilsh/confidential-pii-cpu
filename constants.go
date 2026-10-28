@@ -58,5 +58,13 @@ const (
 	reportFlushTimeout      = 10 * time.Second
 	healthProbeInterval     = 30 * time.Second
 	healthProbeTimeout      = 5 * time.Second
-	healthFailureThreshold  = 3
+	// Keep-alive hygiene on the loopback hops. uvicorn closes an idle
+	// keep-alive connection after workerKeepAlive; the gateway must drop its
+	// idle connections well before that, or a POST reused on a connection the
+	// worker just closed fails with EOF (Go only auto-retries idempotent
+	// requests) and surfaces as a sporadic 502 with nothing in the worker's
+	// logs. Seen in the lab at ~1 in 400 requests under Poisson traffic.
+	workerKeepAlive        = 120 * time.Second
+	workerIdleConnTimeout  = 30 * time.Second
+	healthFailureThreshold = 3
 )
