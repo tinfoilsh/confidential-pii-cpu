@@ -6,15 +6,47 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"time"
 )
 
-// forwardLimits bounds the forward scheduler. maxInflight is the number of
-// model forward passes the workers can run at once (workers × their
-// per-process concurrency); maxQueued is how many windows may wait for a
-// lane before new ones are refused.
+// forwardLimits bounds the forward scheduler and sizes request deadlines.
+// maxInflight is the number of model forward passes the workers can run at
+// once (workers × their per-process concurrency); maxQueued is how many
+// windows may wait for a lane before new ones are refused. A /redact
+// request gets requestBase plus windowTimeout per estimated window, capped
+// at maxRequest; windowTokens/windowOverlap give the estimate.
 type forwardLimits struct {
-	maxInflight int
-	maxQueued   int
+	maxInflight   int
+	maxQueued     int
+	windowTokens  int
+	windowOverlap int
+	windowTimeout time.Duration
+	maxRequest    time.Duration
+	// forwardTimeout is the sharp deadline on one gateway→worker forward
+	// (~40× a window): the wedge detector. Exceeding it fails the owning
+	// /redact and marks the worker unhealthy so the container is replaced.
+	forwardTimeout time.Duration
+}
+
+// requestTimeout scales the /redact deadline with the input size, estimated
+// from the body length before the coordinator has tokenized it. The
+// estimate (one token per four bytes) overshoots for prose, which is the
+// intended direction for a timeout; the ceiling still bounds it.
+func (l forwardLimits) requestTimeout(bodyBytes int) time.Duration {
+	stride := l.windowTokens - 2*l.windowOverlap
+	if stride < 1 {
+		stride = 1
+	}
+	tokens := (bodyBytes + 3) / 4
+	windows := (tokens + stride - 1) / stride
+	if windows < 1 {
+		windows = 1
+	}
+	timeout := requestBaseTimeout + time.Duration(windows)*l.windowTimeout
+	if timeout > l.maxRequest {
+		return l.maxRequest
+	}
+	return timeout
 }
 
 var errForwardQueueFull = errors.New("forward queue full")

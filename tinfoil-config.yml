@@ -31,7 +31,13 @@ containers:
       - OPF_WINDOW_TOKENS: "1024"
       - OPF_WINDOW_OVERLAP: "128"
       - OPF_FORWARD_URL: "http://127.0.0.1:8001/forward"
-      - OPF_MAX_QUEUED_WINDOWS: "512"
+      # 503 means "cannot drain", not "someone sent a big document": a 4 MiB
+      # request is ~250 windows and must succeed.
+      - OPF_MAX_QUEUED_WINDOWS: "4096"
+      - OPF_WINDOW_TIMEOUT_SECONDS: "5"
+      - OPF_MAX_REQUEST_SECONDS: "900"
+      # Per-dispatch wedge detector; a worker that blows it is marked unhealthy.
+      - OPF_FORWARD_TIMEOUT_SECONDS: "30"
     secrets:
       - METRICS_API_KEY
       - USAGE_REPORTER_SECRET

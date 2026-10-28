@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	usage "github.com/tinfoilsh/usage-reporting-go"
 	usageclient "github.com/tinfoilsh/usage-reporting-go/client"
@@ -58,32 +59,56 @@ func workerCount() (int, error) {
 	return n, nil
 }
 
-// positiveEnv reads an integer environment variable that must be at least 1.
-func positiveEnv(name string, fallback int) (int, error) {
+// intEnv reads an integer environment variable that must be at least minimum.
+func intEnv(name string, fallback, minimum int) (int, error) {
 	raw := strings.TrimSpace(os.Getenv(name))
 	if raw == "" {
 		return fallback, nil
 	}
 	n, err := strconv.Atoi(raw)
-	if err != nil || n < 1 {
-		return 0, fmt.Errorf("%s must be a positive integer (got %q)", name, raw)
+	if err != nil || n < minimum {
+		return 0, fmt.Errorf("%s must be an integer >= %d (got %q)", name, minimum, raw)
 	}
 	return n, nil
 }
 
-// forwardLimitsFromEnv sizes the forward scheduler: workers × the per-worker
-// OPF_MAX_CONCURRENCY lanes may run at once, and OPF_MAX_QUEUED_WINDOWS
-// windows may wait for one.
+// forwardLimitsFromEnv sizes the forward scheduler and request deadlines:
+// workers × the per-worker OPF_MAX_CONCURRENCY lanes may run at once,
+// OPF_MAX_QUEUED_WINDOWS windows may wait for one, and a request is allowed
+// OPF_WINDOW_TIMEOUT_SECONDS per window (estimated with OPF_WINDOW_TOKENS /
+// OPF_WINDOW_OVERLAP, the geometry the workers use) up to
+// OPF_MAX_REQUEST_SECONDS. Each dispatched forward must finish within
+// OPF_FORWARD_TIMEOUT_SECONDS or its worker is considered wedged.
 func forwardLimitsFromEnv(workers int) (forwardLimits, error) {
-	concurrency, err := positiveEnv("OPF_MAX_CONCURRENCY", defaultMaxConcurrency)
-	if err != nil {
-		return forwardLimits{}, err
+	var limits forwardLimits
+	var concurrency, windowTimeout, maxRequest, forwardTimeout int
+	for _, v := range []struct {
+		name              string
+		fallback, minimum int
+		into              *int
+	}{
+		{"OPF_MAX_CONCURRENCY", defaultMaxConcurrency, 1, &concurrency},
+		{"OPF_MAX_QUEUED_WINDOWS", defaultMaxQueuedWindows, 1, &limits.maxQueued},
+		{"OPF_WINDOW_TOKENS", defaultWindowTokens, 1, &limits.windowTokens},
+		{"OPF_WINDOW_OVERLAP", defaultWindowOverlap, 0, &limits.windowOverlap},
+		{"OPF_WINDOW_TIMEOUT_SECONDS", int(defaultWindowTimeout / time.Second), 1, &windowTimeout},
+		{"OPF_MAX_REQUEST_SECONDS", int(defaultMaxRequest / time.Second), 1, &maxRequest},
+		{"OPF_FORWARD_TIMEOUT_SECONDS", int(defaultForwardTimeout / time.Second), 1, &forwardTimeout},
+	} {
+		n, err := intEnv(v.name, v.fallback, v.minimum)
+		if err != nil {
+			return forwardLimits{}, err
+		}
+		*v.into = n
 	}
-	queued, err := positiveEnv("OPF_MAX_QUEUED_WINDOWS", defaultMaxQueuedWindows)
-	if err != nil {
-		return forwardLimits{}, err
+	if 2*limits.windowOverlap >= limits.windowTokens {
+		return forwardLimits{}, fmt.Errorf("OPF_WINDOW_TOKENS (%d) must exceed twice OPF_WINDOW_OVERLAP (%d)", limits.windowTokens, limits.windowOverlap)
 	}
-	return forwardLimits{maxInflight: workers * concurrency, maxQueued: queued}, nil
+	limits.maxInflight = workers * concurrency
+	limits.windowTimeout = time.Duration(windowTimeout) * time.Second
+	limits.maxRequest = time.Duration(maxRequest) * time.Second
+	limits.forwardTimeout = time.Duration(forwardTimeout) * time.Second
+	return limits, nil
 }
 
 func run(ctx context.Context) error {
@@ -142,7 +167,7 @@ func run(ctx context.Context) error {
 		}(i, watchHealth(backendCtx, backendURL+healthPath, healthProbeInterval))
 	}
 
-	server := &http.Server{Addr: listenAddress, Handler: newGateway(targets, reporter, limits), ReadHeaderTimeout: headerTimeout, ReadTimeout: inferenceTimeout, IdleTimeout: inferenceTimeout}
+	server := &http.Server{Addr: listenAddress, Handler: newGateway(targets, reporter, limits), ReadHeaderTimeout: headerTimeout, ReadTimeout: limits.maxRequest, IdleTimeout: limits.maxRequest}
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.ListenAndServe() }()
 
