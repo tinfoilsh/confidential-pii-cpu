@@ -113,7 +113,7 @@ func TestGatewayOwnsBilling(t *testing.T) {
 				t.Fatalf("events: %+v", batch.Events)
 			}
 			event := batch.Events[0]
-			if event.APIKey != strings.TrimPrefix(tc.auth, "Bearer ") || event.CustomerRequests != 1 || event.Operation.Service != usage.ServicePIIFilter || event.Operation.Name != usage.OperationPIIFilterRedact {
+			if event.APIKey != strings.TrimPrefix(tc.auth, "Bearer ") || event.CustomerRequests != 1 || event.Operation.Service != usage.ServiceRouter || event.Operation.Name != usage.OperationRouterModelRequest || event.Attributes["model"] != billingModel || event.Attributes["route"] != redactPath {
 				t.Fatalf("incorrect attribution: %+v", event)
 			}
 			if event.RequestID == "" || event.EventID == "" || response.Header().Get(billableRequestsHeader) != "1" {

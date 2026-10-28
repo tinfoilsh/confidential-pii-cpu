@@ -3,8 +3,10 @@ package main
 import "time"
 
 const (
-	listenAddress          = ":8001"
-	inferenceHost          = "127.0.0.1"
+	listenAddress = ":8001"
+	inferenceHost = "127.0.0.1"
+	// Catalog model name the usage event is billed under.
+	billingModel           = "pii-filter"
 	inferenceBasePort      = 8002
 	maxWorkers             = 8
 	controlplaneURL        = "https://api.tinfoil.sh"

@@ -136,12 +136,18 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 					slog.Error("redact response carried no input token count")
 					return errMissingInputTokens
 				}
+				// Reported in the router's model_request shape so the control
+				// plane prices it from the model catalog: input tokens at the
+				// per-token rate plus the per-request price (the floor). The
+				// pii-filter:redact per-request entry is the fallback for
+				// enclaves that predate the token meter.
 				reporter.AddEvent(usage.Event{
 					RequestID:        uuid.NewString(),
 					APIKey:           parts[1],
-					Operation:        usage.Operation{Service: usage.ServicePIIFilter, Name: usage.OperationPIIFilterRedact},
+					Operation:        usage.Operation{Service: usage.ServiceRouter, Name: usage.OperationRouterModelRequest},
 					CustomerRequests: 1,
 					Meters:           []usage.Meter{{Name: usage.MeterInputTokens, Quantity: inputTokens}},
+					Attributes:       map[string]string{"model": billingModel, "route": redactPath, "streaming": "false"},
 				})
 				resp.Header.Set(billableRequestsHeader, "1")
 			}
