@@ -27,9 +27,13 @@ containers:
       - OPF_MAX_CONCURRENCY: "1"
       - OPF_WORKERS: "4"
       # Long inputs are cut into overlapping windows that the gateway's
-      # /forward queue spreads across every worker, fairly per caller.
-      - OPF_WINDOW_TOKENS: "1024"
-      - OPF_WINDOW_OVERLAP: "128"
+      # /forward queue spreads across every worker, fairly per caller. The
+      # overlap must cover the model's receptive field (8 layers x 128 =
+      # 1024; enforced from the checkpoint config at startup) so chunked
+      # scores equal one long pass exactly. Stride 4096: +50% compute on
+      # long inputs, none on inputs that fit one window.
+      - OPF_WINDOW_TOKENS: "6144"
+      - OPF_WINDOW_OVERLAP: "1024"
       - OPF_FORWARD_URL: "http://127.0.0.1:8001/forward"
       # 503 means "cannot drain", not "someone sent a big document": a 4 MiB
       # request is ~250 windows and must succeed.
@@ -38,6 +42,13 @@ containers:
       - OPF_MAX_REQUEST_SECONDS: "900"
       # Per-dispatch wedge detector; a worker that blows it is marked unhealthy.
       - OPF_FORWARD_TIMEOUT_SECONDS: "30"
+      # Short requests (<= OPF_SHORT_REQUEST_TOKENS, default one window) go
+      # first; long windows are held when the k-th soonest-freeing other
+      # lane is not predicted free within horizon k ("" or "0" disables).
+      # ARMED_SECONDS > 0 applies the rule only after recent short traffic.
+      - OPF_SHORT_LANE_HORIZONS: "1.5,3.0"
+      - OPF_SHORT_LANE_ARMED_SECONDS: "0"
+      - OPF_MS_PER_TOKEN: "0.8"
     secrets:
       - METRICS_API_KEY
       - USAGE_REPORTER_SECRET
