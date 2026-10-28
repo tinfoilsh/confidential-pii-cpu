@@ -2,8 +2,9 @@
 weights (and no torch) load."""
 
 import asyncio
-import json
+import struct
 import threading
+from array import array
 
 import httpx
 import pytest
@@ -23,10 +24,22 @@ def text_of(n):
     return " ".join(str(i) for i in range(n))
 
 
-def fake_forward(tokens):
+CLASSES = 2
+
+
+def fake_rows(tokens):
     """Row i is [token, position-in-window]: the second column makes a row
     depend on where the window was cut, like a truncated attention band."""
     return [[float(tok), float(i)] for i, tok in enumerate(tokens)]
+
+
+def fake_forward(tokens):
+    rows = fake_rows(tokens)
+    return struct.pack(f"<{len(rows) * CLASSES}f", *(v for r in rows for v in r)), CLASSES
+
+
+def rows_of(scores, classes):
+    return memoryview(scores).cast("f", shape=(len(scores) // 4 // classes, classes)).tolist()
 
 
 class Finisher:
@@ -35,8 +48,8 @@ class Finisher:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, text, tokens, rows):
-        self.calls.append((text, tokens, rows))
+    def __call__(self, text, tokens, scores, classes):
+        self.calls.append((text, tokens, rows_of(scores, classes) if tokens else []))
         return {
             "schema_version": 1,
             "summary": {},
@@ -61,6 +74,7 @@ def stubbed(monkeypatch):
     monkeypatch.setattr(server, "WINDOW_TOKENS", 1024)
     monkeypatch.setattr(server, "WINDOW_OVERLAP", 128)
     monkeypatch.setattr(server, "FORWARD_URL", None)
+    monkeypatch.setattr(server, "FORWARD_FANOUT", 4)
     monkeypatch.setattr(server, "_forward_client", None)
     return finisher
 
@@ -75,22 +89,35 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def test_forward_scores_one_window(stubbed):
+def post_forward(c, tokens):
+    return c.post(
+        "/forward",
+        content=array("i", tokens).tobytes(),
+        headers={"Content-Type": "application/octet-stream"},
+    )
+
+
+def test_forward_scores_one_window_as_float32_bytes(stubbed):
     async def go():
         async with client() as c:
-            return await c.post("/forward", json={"tokens": [5, 6, 7]})
+            return await post_forward(c, [5, 6, 7])
 
     response = run(go())
     assert response.status_code == 200
-    assert response.json() == {"logprobs": fake_forward([5, 6, 7])}
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert response.headers[server.SHAPE_HEADER] == f"3,{CLASSES}"
+    assert response.content == fake_forward([5, 6, 7])[0]
+    assert rows_of(response.content, CLASSES) == fake_rows([5, 6, 7])
 
 
-def test_forward_rejects_empty_window(stubbed):
+def test_forward_rejects_empty_or_misaligned_window(stubbed):
     async def go():
         async with client() as c:
-            return await c.post("/forward", json={"tokens": []})
+            empty = await post_forward(c, [])
+            ragged = await c.post("/forward", content=b"abc")
+            return empty.status_code, ragged.status_code
 
-    assert run(go()).status_code == 422
+    assert run(go()) == (422, 422)
 
 
 def test_forward_lane_is_serialized_by_the_semaphore(stubbed, monkeypatch):
@@ -109,8 +136,8 @@ def test_forward_lane_is_serialized_by_the_semaphore(stubbed, monkeypatch):
 
     async def go():
         async with client() as c:
-            first = asyncio.create_task(c.post("/forward", json={"tokens": [1]}))
-            second = asyncio.create_task(c.post("/forward", json={"tokens": [2]}))
+            first = asyncio.create_task(post_forward(c, [1]))
+            second = asyncio.create_task(post_forward(c, [2]))
             await asyncio.sleep(0.2)
             release.set()
             return await asyncio.gather(first, second)
@@ -139,7 +166,7 @@ def test_redact_in_process_stitches_windows_like_one_pass(stubbed):
     # window on both sides; the position column is window-relative.
     expected = []
     for plan in plans:
-        expected.extend(fake_forward(tokens[plan.start : plan.end])[plan.keep_start - plan.start : plan.keep_end - plan.start])
+        expected.extend(fake_rows(tokens[plan.start : plan.end])[plan.keep_start - plan.start : plan.keep_end - plan.start])
     assert rows == expected
     assert [r[0] for r in rows] == [float(t) for t in tokens]
 
@@ -161,15 +188,32 @@ def remote(stubbed, monkeypatch):
     """Route windows through a fake gateway /forward that records each call."""
     class Seen(list):
         fail_window = None
+        in_flight = 0
+        peak = 0
 
     seen = Seen()
 
-    def handler(request):
-        payload = json.loads(request.content)
-        seen.append((request.headers.get(server.KEY_HASH_HEADER), payload["tokens"]))
-        if len(seen) == seen.fail_window:
+    async def handler(request):
+        tokens = array("i")
+        tokens.frombytes(request.content)
+        tokens = list(tokens)
+        seen.append((request.headers.get(server.KEY_HASH_HEADER), tokens))
+        ordinal = len(seen)
+        seen.in_flight += 1
+        seen.peak = max(seen.peak, seen.in_flight)
+        await asyncio.sleep(0.01)  # let the other windows pile up
+        seen.in_flight -= 1
+        if ordinal == seen.fail_window:
             return httpx.Response(503, text="privacy filter is at capacity")
-        return httpx.Response(200, json={"logprobs": fake_forward(payload["tokens"])})
+        payload, classes = fake_forward(tokens)
+        return httpx.Response(
+            200,
+            content=payload,
+            headers={
+                "Content-Type": "application/octet-stream",
+                server.SHAPE_HEADER: f"{len(tokens)},{classes}",
+            },
+        )
 
     monkeypatch.setattr(server, "FORWARD_URL", "http://gateway/forward")
     monkeypatch.setattr(
@@ -193,6 +237,7 @@ def test_redact_fans_windows_out_through_the_gateway(stubbed, remote):
     response = run(go())
     assert response.status_code == 200
     assert len(remote) == len(plans)
+    assert remote.peak == server.FORWARD_FANOUT  # bounded, but saturated
     assert {key for key, _ in remote} == {"caller-hash"}
     assert sorted(tokens[0] for _, tokens in remote) == [p.start for p in plans]
     (_, tokens, rows), = stubbed.calls

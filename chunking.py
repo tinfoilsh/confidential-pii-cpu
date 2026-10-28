@@ -77,21 +77,35 @@ def plan_windows(n_tokens: int, window: int, overlap: int) -> list[WindowPlan]:
     return plans
 
 
-def assemble(plans: Sequence[WindowPlan], outputs: Sequence[Sequence[Row]], n_tokens: int) -> list[Row]:
-    """Stitch per-window forward outputs into one row per token.
+def kept_outputs(
+    plans: Sequence[WindowPlan], outputs: Sequence[Sequence[Row]], n_tokens: int
+) -> list[Sequence[Row]]:
+    """Reduce per-window forward outputs to their kept rows, in token order.
 
-    `outputs[i]` must hold one row per token of `plans[i]`. Raises if the
-    kept regions do not cover every token exactly once.
+    `outputs[i]` must hold one row per token of `plans[i]` (any sliceable:
+    a list, a 2-D memoryview over float32 bytes, a tensor). Raises if the
+    kept regions do not cover every token exactly once. Concatenating the
+    returned slices gives one row per token.
     """
     if len(plans) != len(outputs):
         raise ValueError(f"{len(plans)} windows but {len(outputs)} outputs")
-    rows: list[Row] = []
+    kept: list[Sequence[Row]] = []
+    cursor = 0
     for plan, out in zip(plans, outputs):
-        if plan.keep_start != len(rows):
+        if plan.keep_start != cursor:
             raise ValueError(
-                f"window {plan.start}:{plan.end} keeps from {plan.keep_start}, expected {len(rows)}"
+                f"window {plan.start}:{plan.end} keeps from {plan.keep_start}, expected {cursor}"
             )
-        rows.extend(plan.kept_rows(out))
-    if len(rows) != n_tokens:
-        raise ValueError(f"assembled {len(rows)} rows for {n_tokens} tokens")
+        kept.append(plan.kept_rows(out))
+        cursor = plan.keep_end
+    if cursor != n_tokens:
+        raise ValueError(f"assembled {cursor} rows for {n_tokens} tokens")
+    return kept
+
+
+def assemble(plans: Sequence[WindowPlan], outputs: Sequence[Sequence[Row]], n_tokens: int) -> list[Row]:
+    """Stitch per-window forward outputs into one flat list of rows."""
+    rows: list[Row] = []
+    for part in kept_outputs(plans, outputs, n_tokens):
+        rows.extend(part)
     return rows
