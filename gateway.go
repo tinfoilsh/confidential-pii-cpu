@@ -37,6 +37,10 @@ type worker struct {
 	proxy    *httputil.ReverseProxy
 	inflight atomic.Int64 // /redact requests being coordinated
 	forwards int          // model forwards running; guarded by forwardScheduler.mu
+	// wedged is set when a forward on this worker exceeded forwardTimeout.
+	// It is sticky: /health fails until the container is replaced, since a
+	// forward that outlived ~40 windows' worth of time is not coming back.
+	wedged atomic.Bool
 }
 
 func pickWorker(workers []*worker) *worker {
@@ -59,7 +63,7 @@ func pickWorker(workers []*worker) *worker {
 // worker and short requests from other callers interleave with them.
 func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits) http.Handler {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.ResponseHeaderTimeout = inferenceTimeout
+	transport.ResponseHeaderTimeout = limits.maxRequest
 	transport.DisableCompression = true
 	workers := make([]*worker, len(targets))
 	for i, target := range targets {
@@ -92,6 +96,7 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 	healthClient := &http.Client{Transport: transport, Timeout: healthProbeTimeout}
 	forwardClient := &http.Client{Transport: transport}
 	scheduler := newForwardScheduler(workers, limits)
+	var forwardTimeouts atomic.Int64
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+redactPath, func(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +112,7 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
-		ctx, cancel := context.WithTimeout(r.Context(), inferenceTimeout)
+		ctx, cancel := context.WithTimeout(r.Context(), limits.requestTimeout(len(body)))
 		defer cancel()
 		picked := pickWorker(workers)
 		picked.inflight.Add(1)
@@ -143,8 +148,9 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 		}
 		requestProxy.ServeHTTP(w, r.WithContext(ctx))
 	})
-	// Internal: one model forward over one window. Reached only from the
-	// coordinating workers on this host; the shim never exposes it.
+	// Internal: one model forward over one window (binary in, binary out;
+	// the payloads are opaque here). Reached only from the coordinating
+	// workers on this host; the shim never exposes it.
 	mux.HandleFunc("POST "+forwardPath, func(w http.ResponseWriter, r *http.Request) {
 		if !isLoopback(r.RemoteAddr) {
 			http.Error(w, "forward is internal", http.StatusForbidden)
@@ -160,7 +166,7 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 			http.Error(w, "privacy filter is at capacity", http.StatusServiceUnavailable)
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), inferenceTimeout)
+		ctx, cancel := context.WithTimeout(r.Context(), limits.maxRequest)
 		defer cancel()
 		var picked *worker
 		select {
@@ -174,14 +180,25 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 		}
 		defer scheduler.release(picked)
 		start := time.Now()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, picked.target.String()+forwardPath, bytes.NewReader(body))
+		// The queue wait above is bounded by the generous request ceiling;
+		// the forward itself gets the sharp per-window deadline.
+		forwardCtx, cancelForward := context.WithTimeout(ctx, limits.forwardTimeout)
+		defer cancelForward()
+		req, err := http.NewRequestWithContext(forwardCtx, http.MethodPost, picked.target.String()+forwardPath, bytes.NewReader(body))
 		if err != nil {
 			http.Error(w, "privacy filter unavailable", http.StatusBadGateway)
 			return
 		}
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", r.Header.Get("Content-Type"))
 		resp, err := forwardClient.Do(req)
 		if err != nil {
+			if errors.Is(forwardCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+				forwardTimeouts.Add(1)
+				picked.wedged.Store(true)
+				slog.Error("forward timed out; worker marked unhealthy", "worker", picked.target.Host, "timeout", limits.forwardTimeout)
+				http.Error(w, "privacy filter forward timed out", http.StatusGatewayTimeout)
+				return
+			}
 			slog.Error("forward upstream unavailable", "error", err)
 			http.Error(w, "privacy filter unavailable", http.StatusBadGateway)
 			return
@@ -191,6 +208,9 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 			slog.Warn("forward failed", "status", resp.StatusCode, "elapsed", time.Since(start))
 		}
 		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+		if shape := resp.Header.Get(forwardShapeHeader); shape != "" {
+			w.Header().Set(forwardShapeHeader, shape)
+		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
 	})
@@ -208,6 +228,11 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 			}(i, wk.target)
 		}
 		wg.Wait()
+		for i, wk := range workers {
+			if wk.wedged.Load() {
+				failures[i] = errors.New("forward timed out")
+			}
+		}
 		for i, err := range failures {
 			if err != nil {
 				slog.Warn("worker unhealthy", "worker", i, "error", err)
@@ -231,8 +256,8 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 			}
 			stats := reporter.Stats()
 			queued, inflight := scheduler.stats()
-			suffix := fmt.Sprintf("\npii_usage_enqueued_total %d\npii_usage_delivered_total %d\npii_usage_failed_total %d\npii_usage_dropped_total %d\npii_forward_queued %d\npii_forward_inflight %d\n",
-				stats.Enqueued, stats.DeliveredEvents, stats.FailedEvents, stats.DroppedDisabled+stats.DroppedBufferFull, queued, inflight)
+			suffix := fmt.Sprintf("\npii_usage_enqueued_total %d\npii_usage_delivered_total %d\npii_usage_failed_total %d\npii_usage_dropped_total %d\npii_forward_queued %d\npii_forward_inflight %d\npii_forward_timeouts_total %d\n",
+				stats.Enqueued, stats.DeliveredEvents, stats.FailedEvents, stats.DroppedDisabled+stats.DroppedBufferFull, queued, inflight, forwardTimeouts.Load())
 			resp.Body = &appendedBody{Reader: io.MultiReader(resp.Body, strings.NewReader(suffix)), Closer: resp.Body}
 			resp.ContentLength = -1
 			resp.Header.Del("Content-Length")
