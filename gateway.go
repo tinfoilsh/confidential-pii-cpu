@@ -223,6 +223,12 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 		if shape := resp.Header.Get(forwardShapeHeader); shape != "" {
 			w.Header().Set(forwardShapeHeader, shape)
 		}
+		// Relay the length so a body cut short by a worker hiccup is a
+		// transport error at the coordinator (retried) rather than a
+		// silently short score matrix.
+		if resp.ContentLength >= 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
 	})

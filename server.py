@@ -335,37 +335,53 @@ async def run_window(
                     forward_tokens, tokens, position_offset
                 )
             return scores_view(payload, len(tokens), classes)
-        try:
-            async with fanout:
-                response = await _forward_client.post(
-                    FORWARD_URL,
-                    content=array("i", tokens).tobytes(),
-                    headers={
-                        "Content-Type": OCTET_STREAM,
-                        KEY_HASH_HEADER: key_hash,
-                        REQUEST_TOKENS_HEADER: str(request_tokens),
-                        POSITION_OFFSET_HEADER: str(position_offset),
-                    },
+        # A transport failure or a malformed reply (missing shape header,
+        # short body) is retried once: the window is idempotent and cheap
+        # next to failing a whole multi-window request. Status replies
+        # (503 capacity, 504 wedge) are not retried; they carry meaning.
+        last_error = None
+        for attempt in range(2):
+            try:
+                async with fanout:
+                    response = await _forward_client.post(
+                        FORWARD_URL,
+                        content=array("i", tokens).tobytes(),
+                        headers={
+                            "Content-Type": OCTET_STREAM,
+                            KEY_HASH_HEADER: key_hash,
+                            REQUEST_TOKENS_HEADER: str(request_tokens),
+                            POSITION_OFFSET_HEADER: str(position_offset),
+                        },
+                    )
+            except httpx.HTTPError as exc:
+                FORWARD_FAILURES.labels(status="transport").inc()
+                last_error = f"forward dispatch failed: {type(exc).__name__}: {exc}"
+                log.warning("window @%d (%d tokens) attempt %d: %s", position_offset, len(tokens), attempt + 1, last_error)
+                continue
+            if response.status_code != 200:
+                FORWARD_FAILURES.labels(status=str(response.status_code)).inc()
+                if response.status_code == 503:
+                    raise HTTPException(status_code=503, detail="privacy filter is at capacity")
+                # Includes 504: a forward exceeded the gateway's per-window
+                # deadline. The whole request fails; nothing partial is returned.
+                raise HTTPException(
+                    status_code=502, detail=f"forward failed with status {response.status_code}"
                 )
-        except httpx.HTTPError as exc:
-            FORWARD_FAILURES.labels(status="transport").inc()
-            raise HTTPException(status_code=502, detail="forward dispatch failed") from exc
-        if response.status_code != 200:
-            FORWARD_FAILURES.labels(status=str(response.status_code)).inc()
-            if response.status_code == 503:
-                raise HTTPException(status_code=503, detail="privacy filter is at capacity")
-            # Includes 504: a forward exceeded the gateway's per-window
-            # deadline. The whole request fails; nothing partial is returned.
-            raise HTTPException(
-                status_code=502, detail=f"forward failed with status {response.status_code}"
-            )
-        try:
-            rows, classes = (int(v) for v in response.headers[SHAPE_HEADER].split(","))
-            if rows != len(tokens):
-                raise ValueError(f"{rows} rows for {len(tokens)} tokens")
-            return scores_view(response.content, rows, classes)
-        except (KeyError, ValueError) as exc:
-            raise HTTPException(status_code=502, detail=f"malformed forward response: {exc}") from exc
+            try:
+                rows, classes = (int(v) for v in response.headers[SHAPE_HEADER].split(","))
+                if rows != len(tokens):
+                    raise ValueError(f"{rows} rows for {len(tokens)} tokens")
+                return scores_view(response.content, rows, classes)
+            except (KeyError, ValueError, TypeError) as exc:
+                FORWARD_FAILURES.labels(status="malformed").inc()
+                last_error = (
+                    f"malformed forward response: {type(exc).__name__}: {exc} "
+                    f"(status {response.status_code}, {len(response.content)} bytes, "
+                    f"shape={response.headers.get(SHAPE_HEADER)!r})"
+                )
+                log.warning("window @%d (%d tokens) attempt %d: %s", position_offset, len(tokens), attempt + 1, last_error)
+        FORWARD_FAILURES.labels(status="gave_up").inc()
+        raise HTTPException(status_code=502, detail=last_error or "forward failed")
     finally:
         WINDOW_ROUNDTRIP.observe(time.time() - start)
 
