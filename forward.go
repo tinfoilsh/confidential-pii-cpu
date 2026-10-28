@@ -5,27 +5,341 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
+	"sort"
 	"sync"
 	"time"
 )
 
 // forwardLimits bounds the forward scheduler and sizes request deadlines.
-// maxInflight is the number of model forward passes the workers can run at
-// once (workers × their per-process concurrency); maxQueued is how many
-// windows may wait for a lane before new ones are refused. A /redact
-// request gets requestBase plus windowTimeout per estimated window, capped
-// at maxRequest; windowTokens/windowOverlap give the estimate.
 type forwardLimits struct {
-	maxInflight   int
-	maxQueued     int
+	// maxInflight is the number of model forward passes the workers can run
+	// at once (workers × their per-process concurrency): the lane count.
+	maxInflight int
+	// maxQueued is how many windows may wait for a lane before new ones are
+	// refused.
+	maxQueued int
+	// windowTokens/windowOverlap are the workers' window geometry, used to
+	// estimate a request's window count for its deadline.
 	windowTokens  int
 	windowOverlap int
+	// A /redact request gets requestBaseTimeout plus windowTimeout per
+	// estimated window, capped at maxRequest.
 	windowTimeout time.Duration
 	maxRequest    time.Duration
 	// forwardTimeout is the sharp deadline on one gateway→worker forward
 	// (~40× a window): the wedge detector. Exceeding it fails the owning
 	// /redact and marks the worker unhealthy so the container is replaced.
 	forwardTimeout time.Duration
+	// shortTokens: requests at or under this many tokens are "short": their
+	// windows go to the front of the queue and skip the hold rule.
+	shortTokens int
+	// horizons drive the predicted-short-lane rule. After a long window is
+	// dispatched, the k-th soonest-freeing OTHER lane must be predicted to
+	// free within horizons[k]; otherwise the window is held until a lane
+	// frees or the prediction comes within range. Empty disables the rule.
+	horizons []time.Duration
+	// armed > 0 applies the hold rule only while a short request has been
+	// seen within this long, so an idle night runs flat out.
+	armed time.Duration
+	// msPerToken seeds the EWMA used to predict when busy lanes free.
+	msPerToken float64
+}
+
+var errForwardQueueFull = errors.New("forward queue full")
+
+// lane is one forward slot on one worker.
+type lane struct {
+	worker *worker
+	busy   bool
+	start  time.Time
+	tokens int
+}
+
+// forwardItem is one window waiting for a lane. ready receives the lane it
+// was assigned; the sender never blocks because the channel holds one.
+type forwardItem struct {
+	key    string
+	tokens int
+	short  bool
+	ready  chan *lane
+}
+
+// forwardScheduler hands windows to lanes. Short requests' windows are
+// served first, FIFO. Long requests each have a FIFO queue keyed by the
+// caller hash the /redact proxy stamps on its request; the scheduler
+// round-robins across those callers and sends each window to the worker
+// with the fewest forwards in flight. The hold rule (see forwardLimits)
+// keeps a lane predicted to free soon so a short request arriving mid-way
+// through long documents waits about a horizon, not a whole window.
+type forwardScheduler struct {
+	mu       sync.Mutex
+	lanes    []*lane
+	workers  []*worker
+	limits   forwardLimits
+	short    []*forwardItem
+	queues   map[string][]*forwardItem
+	keys     []string // long-request callers with queued windows, round-robin order
+	next     int      // index into keys of the caller served next
+	queued   int
+	inflight int
+
+	msPerToken float64
+	lastShort  time.Time
+	// holdSince/holdLanes account lane-seconds left idle by the hold rule.
+	holdSince   time.Time
+	holdLanes   int
+	holdSeconds float64
+	holdTimer   *time.Timer
+	now         func() time.Time
+}
+
+func newForwardScheduler(workers []*worker, limits forwardLimits) *forwardScheduler {
+	if limits.maxInflight < 1 {
+		limits.maxInflight = 1
+	}
+	if limits.msPerToken <= 0 {
+		limits.msPerToken = 0.8
+	}
+	s := &forwardScheduler{
+		workers:    workers,
+		limits:     limits,
+		queues:     make(map[string][]*forwardItem),
+		msPerToken: limits.msPerToken,
+		now:        time.Now,
+	}
+	for i := range limits.maxInflight {
+		s.lanes = append(s.lanes, &lane{worker: workers[i%len(workers)]})
+	}
+	return s
+}
+
+// enqueue registers a window. tokens is the window's length (for the ETA
+// model); short marks a window of a short request. It fails when the queue
+// budget is exhausted: nothing queued now could finish inside the request
+// ceiling anyway, so refusing early is kinder than timing out later.
+func (s *forwardScheduler) enqueue(key string, tokens int, short bool) (*forwardItem, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.queued >= s.limits.maxQueued {
+		return nil, errForwardQueueFull
+	}
+	item := &forwardItem{key: key, tokens: tokens, short: short, ready: make(chan *lane, 1)}
+	if short {
+		s.lastShort = s.now()
+		s.short = append(s.short, item)
+	} else {
+		if _, pending := s.queues[key]; !pending {
+			s.keys = append(s.keys, key)
+		}
+		s.queues[key] = append(s.queues[key], item)
+	}
+	s.queued++
+	s.dispatchLocked()
+	return item, nil
+}
+
+// cancel withdraws a window that is still waiting. It reports false when the
+// window was already assigned a lane, in which case the caller must take the
+// lane from item.ready and release it.
+func (s *forwardScheduler) cancel(item *forwardItem) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if item.short {
+		for i, queued := range s.short {
+			if queued == item {
+				s.short = append(s.short[:i], s.short[i+1:]...)
+				s.queued--
+				return true
+			}
+		}
+		return false
+	}
+	queue := s.queues[item.key]
+	for i, queued := range queue {
+		if queued != item {
+			continue
+		}
+		queue = append(queue[:i], queue[i+1:]...)
+		s.queued--
+		if len(queue) == 0 {
+			s.dropKeyLocked(item.key)
+		} else {
+			s.queues[item.key] = queue
+		}
+		return true
+	}
+	return false
+}
+
+// release returns a lane, feeds the ETA model with the observed speed when
+// the forward completed normally, and dispatches whatever is waiting.
+func (s *forwardScheduler) release(l *lane, completed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if completed && l.tokens > 0 {
+		observed := float64(s.now().Sub(l.start).Milliseconds()) / float64(l.tokens)
+		s.msPerToken = 0.8*s.msPerToken + 0.2*observed
+	}
+	l.busy = false
+	l.tokens = 0
+	l.worker.forwards--
+	s.inflight--
+	s.dispatchLocked()
+}
+
+type forwardStats struct {
+	queued, inflight int
+	holdSeconds      float64
+	msPerToken       float64
+}
+
+func (s *forwardScheduler) stats() forwardStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.settleHoldLocked()
+	return forwardStats{queued: s.queued, inflight: s.inflight, holdSeconds: s.holdSeconds, msPerToken: s.msPerToken}
+}
+
+// settleHoldLocked books the idle lane-seconds accrued since the hold began.
+func (s *forwardScheduler) settleHoldLocked() {
+	if s.holdLanes > 0 {
+		s.holdSeconds += s.now().Sub(s.holdSince).Seconds() * float64(s.holdLanes)
+		s.holdSince = s.now()
+	}
+}
+
+func (s *forwardScheduler) dispatchLocked() {
+	s.settleHoldLocked()
+	s.holdLanes = 0
+	if s.holdTimer != nil {
+		s.holdTimer.Stop()
+		s.holdTimer = nil
+	}
+	for s.inflight < len(s.lanes) && s.queued > 0 {
+		item, pop := s.nextLocked()
+		l := s.freeLaneLocked()
+		if !item.short && s.holdActiveLocked() {
+			if wait := s.holdDelayLocked(l); wait > 0 {
+				s.holdSince = s.now()
+				s.holdLanes = len(s.lanes) - s.inflight
+				s.holdTimer = time.AfterFunc(wait, func() {
+					s.mu.Lock()
+					defer s.mu.Unlock()
+					s.dispatchLocked()
+				})
+				return
+			}
+		}
+		pop()
+		s.queued--
+		s.inflight++
+		l.busy, l.start, l.tokens = true, s.now(), item.tokens
+		l.worker.forwards++
+		item.ready <- l
+	}
+}
+
+// nextLocked peeks the window to dispatch next and returns the function that
+// removes it from its queue.
+func (s *forwardScheduler) nextLocked() (*forwardItem, func()) {
+	if len(s.short) > 0 {
+		item := s.short[0]
+		return item, func() { s.short = s.short[1:] }
+	}
+	key := s.keys[s.next]
+	queue := s.queues[key]
+	item := queue[0]
+	return item, func() {
+		if len(queue) == 1 {
+			// Removing the current key shifts the next caller into this slot,
+			// so the cursor stays put.
+			s.dropKeyLocked(key)
+			return
+		}
+		s.queues[key] = queue[1:]
+		s.next = (s.next + 1) % len(s.keys)
+	}
+}
+
+func (s *forwardScheduler) holdActiveLocked() bool {
+	if len(s.limits.horizons) == 0 {
+		return false
+	}
+	if s.limits.armed > 0 && (s.lastShort.IsZero() || s.now().Sub(s.lastShort) > s.limits.armed) {
+		return false
+	}
+	return true
+}
+
+// holdDelayLocked evaluates the hold rule for a long window about to take
+// lane chosen. It returns 0 when the dispatch may proceed, otherwise how
+// long until the predictions could satisfy the rule (a lane release will
+// re-evaluate sooner).
+func (s *forwardScheduler) holdDelayLocked(chosen *lane) time.Duration {
+	now := s.now()
+	var etas []time.Duration // predicted time until each other lane frees
+	for _, l := range s.lanes {
+		if l == chosen {
+			continue
+		}
+		etas = append(etas, s.etaLocked(l, now))
+	}
+	sort.Slice(etas, func(i, j int) bool { return etas[i] < etas[j] })
+	var wait time.Duration
+	for k, horizon := range s.limits.horizons {
+		if k >= len(etas) {
+			break
+		}
+		if over := etas[k] - horizon; over > wait {
+			wait = over
+		}
+	}
+	return wait
+}
+
+func (s *forwardScheduler) etaLocked(l *lane, now time.Time) time.Duration {
+	if !l.busy {
+		return 0
+	}
+	predicted := l.start.Add(time.Duration(float64(l.tokens) * s.msPerToken * float64(time.Millisecond)))
+	if remaining := predicted.Sub(now); remaining > 0 {
+		return remaining
+	}
+	return 0
+}
+
+// freeLaneLocked picks a free lane on the worker with the fewest forwards
+// in flight. Lanes are spread evenly over workers, so whenever the global
+// cap allows a dispatch the least-busy worker has a free lane.
+func (s *forwardScheduler) freeLaneLocked() *lane {
+	var best *lane
+	for _, l := range s.lanes {
+		if l.busy {
+			continue
+		}
+		if best == nil || l.worker.forwards < best.worker.forwards {
+			best = l
+		}
+	}
+	return best
+}
+
+func (s *forwardScheduler) dropKeyLocked(key string) {
+	delete(s.queues, key)
+	for i, k := range s.keys {
+		if k == key {
+			s.keys = append(s.keys[:i], s.keys[i+1:]...)
+			if i < s.next {
+				s.next--
+			}
+			break
+		}
+	}
+	if len(s.keys) == 0 {
+		s.next = 0
+	} else {
+		s.next %= len(s.keys)
+	}
 }
 
 // requestTimeout scales the /redact deadline with the input size, estimated
@@ -47,148 +361,6 @@ func (l forwardLimits) requestTimeout(bodyBytes int) time.Duration {
 		return l.maxRequest
 	}
 	return timeout
-}
-
-var errForwardQueueFull = errors.New("forward queue full")
-
-// forwardItem is one window waiting for a worker. ready receives the worker
-// it was assigned to; the sender never blocks because the channel holds one.
-type forwardItem struct {
-	key   string
-	ready chan *worker
-}
-
-// forwardScheduler hands windows to workers fairly across callers. Every
-// caller (keyed by the hash the /redact proxy stamps on its request) has a
-// FIFO queue; the scheduler round-robins across callers with pending work
-// and sends each window to the worker with the fewest forwards in flight.
-// A caller that fans out a 40k-token document therefore interleaves with a
-// caller sending one short request instead of holding every lane.
-type forwardScheduler struct {
-	mu       sync.Mutex
-	workers  []*worker
-	queues   map[string][]*forwardItem
-	keys     []string // callers with queued windows, in round-robin order
-	next     int      // index into keys of the caller served next
-	queued   int
-	inflight int
-	limits   forwardLimits
-}
-
-func newForwardScheduler(workers []*worker, limits forwardLimits) *forwardScheduler {
-	if limits.maxInflight < 1 {
-		limits.maxInflight = 1
-	}
-	return &forwardScheduler{workers: workers, queues: make(map[string][]*forwardItem), limits: limits}
-}
-
-// enqueue registers a window for the given caller. It fails when the queue
-// budget is exhausted: nothing queued now could finish inside the inference
-// timeout anyway, so refusing early is kinder than timing out later.
-func (s *forwardScheduler) enqueue(key string) (*forwardItem, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.queued >= s.limits.maxQueued {
-		return nil, errForwardQueueFull
-	}
-	item := &forwardItem{key: key, ready: make(chan *worker, 1)}
-	if _, pending := s.queues[key]; !pending {
-		s.keys = append(s.keys, key)
-	}
-	s.queues[key] = append(s.queues[key], item)
-	s.queued++
-	s.dispatchLocked()
-	return item, nil
-}
-
-// cancel withdraws a window that is still waiting. It reports false when the
-// window was already assigned a worker, in which case the caller must take
-// the worker from item.ready and release it.
-func (s *forwardScheduler) cancel(item *forwardItem) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	queue := s.queues[item.key]
-	for i, queuedItem := range queue {
-		if queuedItem != item {
-			continue
-		}
-		queue = append(queue[:i], queue[i+1:]...)
-		s.queued--
-		if len(queue) == 0 {
-			s.dropKeyLocked(item.key)
-		} else {
-			s.queues[item.key] = queue
-		}
-		return true
-	}
-	return false
-}
-
-// release returns a worker lane and dispatches whatever is waiting.
-func (s *forwardScheduler) release(w *worker) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.inflight--
-	w.forwards--
-	s.dispatchLocked()
-}
-
-func (s *forwardScheduler) stats() (queued, inflight int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.queued, s.inflight
-}
-
-func (s *forwardScheduler) dispatchLocked() {
-	for s.inflight < s.limits.maxInflight && s.queued > 0 {
-		key := s.keys[s.next]
-		queue := s.queues[key]
-		item := queue[0]
-		if len(queue) == 1 {
-			// Removing the current key shifts the next caller into this slot,
-			// so the cursor stays put.
-			s.dropKeyLocked(key)
-		} else {
-			s.queues[key] = queue[1:]
-			s.next = (s.next + 1) % len(s.keys)
-		}
-		s.queued--
-		s.inflight++
-		w := s.leastBusyLocked()
-		w.forwards++
-		item.ready <- w
-	}
-}
-
-func (s *forwardScheduler) dropKeyLocked(key string) {
-	delete(s.queues, key)
-	for i, k := range s.keys {
-		if k == key {
-			s.keys = append(s.keys[:i], s.keys[i+1:]...)
-			if i < s.next {
-				s.next--
-			}
-			break
-		}
-	}
-	if len(s.keys) == 0 {
-		s.next = 0
-	} else {
-		s.next %= len(s.keys)
-	}
-}
-
-// leastBusyLocked picks the worker with the fewest forwards in flight. With
-// maxInflight = len(workers) × per-worker concurrency, the least-busy worker
-// always has a free lane whenever the global cap allows a dispatch.
-func (s *forwardScheduler) leastBusyLocked() *worker {
-	best := s.workers[0]
-	for _, w := range s.workers[1:] {
-		if w.forwards < best.forwards {
-			best = w
-		}
-	}
-	return best
 }
 
 // keyHash identifies a caller to the scheduler without ever sending the

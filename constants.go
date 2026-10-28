@@ -21,6 +21,9 @@ const (
 	// inputTokensHeader carries the request's input token count from the
 	// coordinator back to the gateway, which meters it and strips it.
 	inputTokensHeader = "X-Tinfoil-Input-Tokens"
+	// requestTokensHeader carries the owning request's total token count on
+	// each /forward so the scheduler can tell short requests from long ones.
+	requestTokensHeader = "X-Tinfoil-Request-Tokens"
 	// forwardShapeHeader is the worker's "rows,classes" shape of a /forward
 	// response body, relayed to the coordinator untouched.
 	forwardShapeHeader      = "X-Tinfoil-Shape"
@@ -32,15 +35,21 @@ const (
 	// OPF_WINDOW_TIMEOUT_SECONDS per window, up to OPF_MAX_REQUEST_SECONDS;
 	// the latter also bounds a queued window's wait and the server's
 	// read/idle timeouts.
-	requestBaseTimeout     = 30 * time.Second
-	defaultWindowTimeout   = 5 * time.Second
-	defaultForwardTimeout  = 30 * time.Second
-	defaultMaxRequest      = 15 * time.Minute
-	defaultWindowTokens    = 1024
-	defaultWindowOverlap   = 128
-	shutdownTimeout        = 30 * time.Second
-	reportFlushTimeout     = 10 * time.Second
-	healthProbeInterval    = 30 * time.Second
-	healthProbeTimeout     = 5 * time.Second
-	healthFailureThreshold = 3
+	requestBaseTimeout    = 30 * time.Second
+	defaultWindowTimeout  = 5 * time.Second
+	defaultForwardTimeout = 30 * time.Second
+	defaultMaxRequest     = 15 * time.Minute
+	// Window geometry: the model's receptive field is layers × context
+	// (8 × 128 = 1024 for the pinned checkpoint), so the overlap must be at
+	// least that for chunked scores to equal one long pass. The workers
+	// enforce the floor from the checkpoint config at startup.
+	defaultWindowTokens     = 6144
+	defaultWindowOverlap    = 1024
+	defaultShortLaneHorizon = "1.5,3.0"
+	defaultMsPerToken       = 0.8
+	shutdownTimeout         = 30 * time.Second
+	reportFlushTimeout      = 10 * time.Second
+	healthProbeInterval     = 30 * time.Second
+	healthProbeTimeout      = 5 * time.Second
+	healthFailureThreshold  = 3
 )

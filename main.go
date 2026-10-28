@@ -78,7 +78,10 @@ func intEnv(name string, fallback, minimum int) (int, error) {
 // OPF_WINDOW_TIMEOUT_SECONDS per window (estimated with OPF_WINDOW_TOKENS /
 // OPF_WINDOW_OVERLAP, the geometry the workers use) up to
 // OPF_MAX_REQUEST_SECONDS. Each dispatched forward must finish within
-// OPF_FORWARD_TIMEOUT_SECONDS or its worker is considered wedged.
+// OPF_FORWARD_TIMEOUT_SECONDS or its worker is considered wedged. Requests
+// of at most OPF_SHORT_REQUEST_TOKENS are short (priority); the hold rule
+// is OPF_SHORT_LANE_HORIZONS / OPF_SHORT_LANE_ARMED_SECONDS with the ETA
+// model seeded by OPF_MS_PER_TOKEN.
 func forwardLimitsFromEnv(workers int) (forwardLimits, error) {
 	var limits forwardLimits
 	var concurrency, windowTimeout, maxRequest, forwardTimeout int
@@ -104,11 +107,80 @@ func forwardLimitsFromEnv(workers int) (forwardLimits, error) {
 	if 2*limits.windowOverlap >= limits.windowTokens {
 		return forwardLimits{}, fmt.Errorf("OPF_WINDOW_TOKENS (%d) must exceed twice OPF_WINDOW_OVERLAP (%d)", limits.windowTokens, limits.windowOverlap)
 	}
+	shortTokens, err := intEnv("OPF_SHORT_REQUEST_TOKENS", limits.windowTokens, 1)
+	if err != nil {
+		return forwardLimits{}, err
+	}
+	limits.shortTokens = shortTokens
 	limits.maxInflight = workers * concurrency
 	limits.windowTimeout = time.Duration(windowTimeout) * time.Second
 	limits.maxRequest = time.Duration(maxRequest) * time.Second
 	limits.forwardTimeout = time.Duration(forwardTimeout) * time.Second
+	if limits.horizons, err = secondsListEnv("OPF_SHORT_LANE_HORIZONS", defaultShortLaneHorizon); err != nil {
+		return forwardLimits{}, err
+	}
+	armed, err := secondsEnv("OPF_SHORT_LANE_ARMED_SECONDS", 0)
+	if err != nil {
+		return forwardLimits{}, err
+	}
+	limits.armed = armed
+	if limits.msPerToken, err = floatEnv("OPF_MS_PER_TOKEN", defaultMsPerToken); err != nil {
+		return forwardLimits{}, err
+	}
 	return limits, nil
+}
+
+// floatEnv reads a positive floating-point environment variable.
+func floatEnv(name string, fallback float64) (float64, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v <= 0 {
+		return 0, fmt.Errorf("%s must be a positive number (got %q)", name, raw)
+	}
+	return v, nil
+}
+
+// secondsEnv reads a non-negative duration in seconds.
+func secondsEnv(name string, fallback time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative number of seconds (got %q)", name, raw)
+	}
+	return time.Duration(v * float64(time.Second)), nil
+}
+
+// secondsListEnv reads a comma-separated list of seconds. Empty or "0"
+// yields no entries (the hold rule off); the list must be non-decreasing
+// since entry k applies to the k-th soonest-freeing lane.
+func secondsListEnv(name, fallback string) ([]time.Duration, error) {
+	raw, set := os.LookupEnv(name)
+	if !set {
+		raw = fallback
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "0" {
+		return nil, nil
+	}
+	var out []time.Duration
+	for _, field := range strings.Split(raw, ",") {
+		v, err := strconv.ParseFloat(strings.TrimSpace(field), 64)
+		if err != nil || v < 0 {
+			return nil, fmt.Errorf("%s must be comma-separated seconds (got %q)", name, raw)
+		}
+		d := time.Duration(v * float64(time.Second))
+		if len(out) > 0 && d < out[len(out)-1] {
+			return nil, fmt.Errorf("%s must be non-decreasing (got %q)", name, raw)
+		}
+		out = append(out, d)
+	}
+	return out, nil
 }
 
 func run(ctx context.Context) error {

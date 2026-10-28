@@ -161,24 +161,30 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 			http.Error(w, "invalid or oversized request body", http.StatusRequestEntityTooLarge)
 			return
 		}
-		item, err := scheduler.enqueue(r.Header.Get(keyHashHeader))
+		// Window length from the int32 body; the request's total from the
+		// coordinator's header (absent → long, the conservative reading).
+		requestTokens, _ := strconv.Atoi(r.Header.Get(requestTokensHeader))
+		short := requestTokens > 0 && requestTokens <= limits.shortTokens
+		item, err := scheduler.enqueue(r.Header.Get(keyHashHeader), len(body)/4, short)
 		if err != nil {
 			http.Error(w, "privacy filter is at capacity", http.StatusServiceUnavailable)
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), limits.maxRequest)
 		defer cancel()
-		var picked *worker
+		var slot *lane
 		select {
-		case picked = <-item.ready:
+		case slot = <-item.ready:
 		case <-ctx.Done():
 			if !scheduler.cancel(item) {
-				scheduler.release(<-item.ready)
+				scheduler.release(<-item.ready, false)
 			}
 			http.Error(w, "privacy filter is at capacity", http.StatusServiceUnavailable)
 			return
 		}
-		defer scheduler.release(picked)
+		picked := slot.worker
+		completed := false
+		defer func() { scheduler.release(slot, completed) }()
 		start := time.Now()
 		// The queue wait above is bounded by the generous request ceiling;
 		// the forward itself gets the sharp per-window deadline.
@@ -204,7 +210,8 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 			return
 		}
 		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
+		completed = resp.StatusCode == http.StatusOK
+		if !completed {
 			slog.Warn("forward failed", "status", resp.StatusCode, "elapsed", time.Since(start))
 		}
 		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
@@ -255,9 +262,9 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 				return nil
 			}
 			stats := reporter.Stats()
-			queued, inflight := scheduler.stats()
-			suffix := fmt.Sprintf("\npii_usage_enqueued_total %d\npii_usage_delivered_total %d\npii_usage_failed_total %d\npii_usage_dropped_total %d\npii_forward_queued %d\npii_forward_inflight %d\npii_forward_timeouts_total %d\n",
-				stats.Enqueued, stats.DeliveredEvents, stats.FailedEvents, stats.DroppedDisabled+stats.DroppedBufferFull, queued, inflight, forwardTimeouts.Load())
+			fs := scheduler.stats()
+			suffix := fmt.Sprintf("\npii_usage_enqueued_total %d\npii_usage_delivered_total %d\npii_usage_failed_total %d\npii_usage_dropped_total %d\npii_forward_queued %d\npii_forward_inflight %d\npii_forward_timeouts_total %d\npii_forward_hold_seconds_total %.3f\npii_forward_ms_per_token %.4f\n",
+				stats.Enqueued, stats.DeliveredEvents, stats.FailedEvents, stats.DroppedDisabled+stats.DroppedBufferFull, fs.queued, fs.inflight, forwardTimeouts.Load(), fs.holdSeconds, fs.msPerToken)
 			resp.Body = &appendedBody{Reader: io.MultiReader(resp.Body, strings.NewReader(suffix)), Closer: resp.Body}
 			resp.ContentLength = -1
 			resp.Header.Del("Content-Length")

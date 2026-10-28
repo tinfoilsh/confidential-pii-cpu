@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,7 +16,8 @@ import (
 	"time"
 )
 
-var testLimits = forwardLimits{maxInflight: 4, maxQueued: 512, windowTokens: 1024, windowOverlap: 128, windowTimeout: 5 * time.Second, maxRequest: 15 * time.Minute, forwardTimeout: 30 * time.Second}
+// testLimits has the hold rule off; tests that exercise it set horizons.
+var testLimits = forwardLimits{maxInflight: 4, maxQueued: 512, windowTokens: 1024, windowOverlap: 128, windowTimeout: 5 * time.Second, maxRequest: 15 * time.Minute, forwardTimeout: 30 * time.Second, shortTokens: 1024, msPerToken: 0.8}
 
 func limitsWith(maxInflight, maxQueued int) forwardLimits {
 	l := testLimits
@@ -70,9 +74,17 @@ func (fw *fakeWorker) url() *url.URL {
 
 func forwardRequest(t *testing.T, gateway, key string) (int, time.Duration) {
 	t.Helper()
-	req, _ := http.NewRequest(http.MethodPost, gateway+forwardPath, bytes.NewReader([]byte{1, 0, 0, 0}))
+	return forwardWindow(t, gateway, key, 1, 1_000_000) // a window of a long request
+}
+
+// forwardWindow posts one window of `tokens` int32s belonging to a request
+// of requestTokens tokens in total.
+func forwardWindow(t *testing.T, gateway, key string, tokens, requestTokens int) (int, time.Duration) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, gateway+forwardPath, bytes.NewReader(make([]byte, 4*tokens)))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set(keyHashHeader, key)
+	req.Header.Set(requestTokensHeader, strconv.Itoa(requestTokens))
 	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -235,6 +247,136 @@ func TestForwardTimeoutMarksWorkerWedged(t *testing.T) {
 	}
 }
 
+// A short request's window goes ahead of every queued long window.
+func TestShortRequestsAreServedFirst(t *testing.T) {
+	const windowTime = 40 * time.Millisecond
+	fw := newFakeWorker(t, windowTime)
+	gateway := httptest.NewServer(newGateway([]*url.URL{fw.url()}, &recordedUsage{}, limitsWith(1, 512)))
+	defer gateway.Close()
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			forwardWindow(t, gateway.URL, "long", 1, 1_000_000)
+		}()
+	}
+	time.Sleep(windowTime / 2) // one running, 19 queued
+	status, elapsed := forwardWindow(t, gateway.URL, "short", 1, 1)
+	wg.Wait()
+	if status != http.StatusOK || elapsed > 2*windowTime {
+		t.Fatalf("short window: status %d after %v behind 19 long windows", status, elapsed)
+	}
+}
+
+// holdScenario runs a stream of long windows over 4 lanes and measures how
+// long a short window arriving at the given offsets waits.
+func holdScenario(t *testing.T, limits forwardLimits, arrivals []time.Duration, longWindows int) (waits []time.Duration, total time.Duration, fakes []*fakeWorker) {
+	t.Helper()
+	const windowTime = 200 * time.Millisecond
+	const tokens = 100 // × msPerToken 2 = 200 ms predicted, matching the fake
+	limits.msPerToken = 2
+	var targets []*url.URL
+	for range 4 {
+		fw := newFakeWorker(t, windowTime)
+		fakes = append(fakes, fw)
+		targets = append(targets, fw.url())
+	}
+	gateway := httptest.NewServer(newGateway(targets, &recordedUsage{}, limits))
+	defer gateway.Close()
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range longWindows {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if status, _ := forwardWindow(t, gateway.URL, "long", tokens, 1_000_000); status != http.StatusOK {
+				t.Errorf("long window: %d", status)
+			}
+		}()
+	}
+	waits = make([]time.Duration, len(arrivals))
+	for i, at := range arrivals {
+		wg.Add(1)
+		go func(i int, at time.Duration) {
+			defer wg.Done()
+			time.Sleep(at)
+			status, elapsed := forwardWindow(t, gateway.URL, "short", tokens, tokens)
+			if status != http.StatusOK {
+				t.Errorf("short window: %d", status)
+			}
+			waits[i] = elapsed - windowTime
+		}(i, at)
+	}
+	wg.Wait()
+	return waits, time.Since(start), fakes
+}
+
+// With the hold rule, a short window arriving at a random moment during a
+// stream of long windows waits at most about a horizon; without it, it can
+// wait a whole window. The lab measures the capacity cost via
+// pii_forward_hold_seconds_total.
+func TestHoldRuleBoundsShortRequestWait(t *testing.T) {
+	const horizon = 60 * time.Millisecond
+	const tick = 60 * time.Millisecond // scheduling + HTTP slack under -race
+	// Arrivals spread across one 200 ms window cycle (the lanes start in
+	// lockstep at ~0 ms), so without the rule at least one of them lands
+	// just after a cycle boundary and waits most of a window.
+	arrivals := []time.Duration{230 * time.Millisecond, 300 * time.Millisecond, 370 * time.Millisecond}
+	limits := limitsWith(4, 512)
+	limits.horizons = []time.Duration{horizon}
+	waits, _, _ := holdScenario(t, limits, arrivals, 40)
+	for i, wait := range waits {
+		if wait > horizon+tick {
+			t.Fatalf("short window %d (at %v) waited %v with hold rule (horizon %v)", i, arrivals[i], wait, horizon)
+		}
+	}
+	limits.horizons = nil
+	waits, _, _ = holdScenario(t, limits, arrivals, 40)
+	var worst time.Duration
+	for _, wait := range waits {
+		worst = max(worst, wait)
+	}
+	if worst < horizon+tick {
+		t.Fatalf("without the hold rule every short window still waited under %v (worst %v); the rule's test is not discriminating", horizon+tick, worst)
+	}
+}
+
+// With no short traffic the rule must not leave a lane permanently idle:
+// every worker takes windows and throughput stays near the lane count.
+func TestHoldRuleKeepsAllLanesBusyWithoutShortTraffic(t *testing.T) {
+	limits := limitsWith(4, 512)
+	limits.horizons = []time.Duration{60 * time.Millisecond}
+	_, total, fakes := holdScenario(t, limits, nil, 24)
+	for i, fw := range fakes {
+		if fw.calls.Load() == 0 {
+			t.Fatalf("worker %d never ran a window", i)
+		}
+	}
+	// 24 windows × 200 ms over 4 lanes is 1.2 s flat out; the rule's cost is
+	// bounded by one lane idling (window − horizon) per cycle.
+	if total > 2200*time.Millisecond {
+		t.Fatalf("24 windows took %v; a lane is idling", total)
+	}
+}
+
+// Armed mode: with no short request seen recently the rule is off and the
+// lanes run flat out.
+func TestHoldRuleArmedOnlyAfterShortTraffic(t *testing.T) {
+	limits := limitsWith(4, 512)
+	limits.horizons = []time.Duration{60 * time.Millisecond}
+	limits.armed = time.Hour
+	_, total, fakes := holdScenario(t, limits, nil, 8)
+	for i, fw := range fakes {
+		if fw.calls.Load() != 2 {
+			t.Fatalf("worker %d ran %d of 8 windows; lanes not saturated while disarmed", i, fw.calls.Load())
+		}
+	}
+	if total > 700*time.Millisecond {
+		t.Fatalf("8 windows took %v while disarmed; expected ~400 ms", total)
+	}
+}
+
 func TestForwardIsLoopbackOnly(t *testing.T) {
 	fw := newFakeWorker(t, 0)
 	handler := newGateway([]*url.URL{fw.url()}, &recordedUsage{}, testLimits)
@@ -299,24 +441,38 @@ func TestRequestTimeoutScalesWithInputSize(t *testing.T) {
 }
 
 func TestForwardLimitsFromEnv(t *testing.T) {
-	for _, name := range []string{"OPF_MAX_CONCURRENCY", "OPF_MAX_QUEUED_WINDOWS", "OPF_WINDOW_TOKENS", "OPF_WINDOW_OVERLAP", "OPF_WINDOW_TIMEOUT_SECONDS", "OPF_MAX_REQUEST_SECONDS", "OPF_FORWARD_TIMEOUT_SECONDS"} {
+	for _, name := range []string{"OPF_MAX_CONCURRENCY", "OPF_MAX_QUEUED_WINDOWS", "OPF_WINDOW_TOKENS", "OPF_WINDOW_OVERLAP", "OPF_WINDOW_TIMEOUT_SECONDS", "OPF_MAX_REQUEST_SECONDS", "OPF_FORWARD_TIMEOUT_SECONDS", "OPF_SHORT_REQUEST_TOKENS", "OPF_SHORT_LANE_ARMED_SECONDS", "OPF_MS_PER_TOKEN"} {
 		t.Setenv(name, "")
 	}
+	os.Unsetenv("OPF_SHORT_LANE_HORIZONS")
 	limits, err := forwardLimitsFromEnv(4)
-	want := forwardLimits{maxInflight: 4, maxQueued: defaultMaxQueuedWindows, windowTokens: 1024, windowOverlap: 128, windowTimeout: 5 * time.Second, maxRequest: 15 * time.Minute, forwardTimeout: 30 * time.Second}
-	if err != nil || limits != want {
+	want := forwardLimits{maxInflight: 4, maxQueued: defaultMaxQueuedWindows, windowTokens: 6144, windowOverlap: 1024, windowTimeout: 5 * time.Second, maxRequest: 15 * time.Minute, forwardTimeout: 30 * time.Second, shortTokens: 6144, horizons: []time.Duration{1500 * time.Millisecond, 3 * time.Second}, msPerToken: 0.8}
+	if err != nil || fmt.Sprint(limits) != fmt.Sprint(want) {
 		t.Fatalf("defaults: %+v, %v", limits, err)
 	}
+	t.Setenv("OPF_SHORT_LANE_HORIZONS", "0")
+	t.Setenv("OPF_SHORT_LANE_ARMED_SECONDS", "600")
+	t.Setenv("OPF_SHORT_REQUEST_TOKENS", "2048")
+	t.Setenv("OPF_MS_PER_TOKEN", "1.25")
+	limits, err = forwardLimitsFromEnv(4)
+	if err != nil || len(limits.horizons) != 0 || limits.armed != 10*time.Minute || limits.shortTokens != 2048 || limits.msPerToken != 1.25 {
+		t.Fatalf("hold rule config: %+v, %v", limits, err)
+	}
+	t.Setenv("OPF_SHORT_LANE_HORIZONS", "3,1.5")
+	if _, err := forwardLimitsFromEnv(4); err == nil {
+		t.Fatal("accepted decreasing horizons")
+	}
+	t.Setenv("OPF_SHORT_LANE_HORIZONS", "")
 	t.Setenv("OPF_MAX_CONCURRENCY", "2")
 	t.Setenv("OPF_MAX_QUEUED_WINDOWS", "16")
-	t.Setenv("OPF_WINDOW_TOKENS", "2048")
+	t.Setenv("OPF_WINDOW_TOKENS", "4096")
 	t.Setenv("OPF_WINDOW_TIMEOUT_SECONDS", "3")
 	t.Setenv("OPF_MAX_REQUEST_SECONDS", "600")
 	limits, err = forwardLimitsFromEnv(4)
-	if err != nil || limits.maxInflight != 8 || limits.maxQueued != 16 || limits.windowTokens != 2048 || limits.windowTimeout != 3*time.Second || limits.maxRequest != 10*time.Minute {
+	if err != nil || limits.maxInflight != 8 || limits.maxQueued != 16 || limits.windowTokens != 4096 || limits.windowTimeout != 3*time.Second || limits.maxRequest != 10*time.Minute {
 		t.Fatalf("configured: %+v, %v", limits, err)
 	}
-	t.Setenv("OPF_WINDOW_OVERLAP", "1024")
+	t.Setenv("OPF_WINDOW_OVERLAP", "2048")
 	if _, err := forwardLimitsFromEnv(4); err == nil {
 		t.Fatal("accepted an overlap that leaves no stride")
 	}
