@@ -26,26 +26,22 @@ containers:
       - OPF_NUM_THREADS: "8"
       - OPF_MAX_CONCURRENCY: "1"
       - OPF_WORKERS: "4"
-      # Long inputs are cut into overlapping windows that the gateway's
-      # /forward queue spreads across every worker, fairly per caller. The
-      # overlap must cover the model's receptive field (8 layers x 128 =
-      # 1024; enforced from the checkpoint config at startup) so chunked
-      # scores equal one long pass exactly. Stride 4096: +50% compute on
-      # long inputs, none on inputs that fit one window.
+      # Long inputs run as 6144-token windows overlapping by 1024 (the
+      # model's receptive field), so chunked output equals one long pass.
       - OPF_WINDOW_TOKENS: "6144"
       - OPF_WINDOW_OVERLAP: "1024"
+      # Windows go through the gateway's fair queue across all workers.
       - OPF_FORWARD_URL: "http://127.0.0.1:8001/forward"
-      # 503 means "cannot drain", not "someone sent a big document": a 4 MiB
-      # request is ~250 windows and must succeed.
+      # 503 only when the queue cannot drain; a 4 MiB request is ~250 windows.
       - OPF_MAX_QUEUED_WINDOWS: "4096"
+      # Size allowances per window / per request; FORWARD_TIMEOUT is the
+      # wedge detector (worker marked unhealthy).
       - OPF_WINDOW_TIMEOUT_SECONDS: "5"
       - OPF_MAX_REQUEST_SECONDS: "900"
-      # Per-dispatch wedge detector; a worker that blows it is marked unhealthy.
       - OPF_FORWARD_TIMEOUT_SECONDS: "30"
-      # Short requests (<= OPF_SHORT_REQUEST_TOKENS, default one window) go
-      # first; long windows are held when the k-th soonest-freeing other
-      # lane is not predicted free within horizon k ("" or "0" disables).
-      # ARMED_SECONDS > 0 applies the rule only after recent short traffic.
+      # Short requests go first; a long window waits if no lane would be
+      # free for a short one within 0.5 s / 1.5 s. Active for 30 s after
+      # short traffic; MS_PER_TOKEN seeds the lane-ETA estimate.
       - OPF_SHORT_LANE_HORIZONS: "0.5,1.5"
       - OPF_SHORT_LANE_ARMED_SECONDS: "30"
       - OPF_MS_PER_TOKEN: "0.5"
