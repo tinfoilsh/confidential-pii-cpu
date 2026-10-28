@@ -62,6 +62,14 @@ func pickWorker(workers []*worker) *worker {
 // runs them on whichever worker has a free lane, so long documents use every
 // worker and short requests from other callers interleave with them.
 func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits) http.Handler {
+	return newGatewayWithUsageContext(targets, reporter, limits, "")
+}
+
+// newGatewayWithUsageContext also verifies the signed usage context a parent
+// service (websearch under a router chat) sends with a call, so the usage
+// event carries root_request_id / parent_service / depth and the control
+// plane can tell a nested tool call from a customer's own request.
+func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limits forwardLimits, usageContextSecret string) http.Handler {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = limits.maxRequest
 	transport.DisableCompression = true
@@ -106,6 +114,12 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 			http.Error(w, "bearer credential required", http.StatusUnauthorized)
 			return
 		}
+		contextAttributes, err := usageContextAttributes(r.Header, parts[1], usageContextSecret)
+		if err != nil {
+			slog.Warn("rejected usage context", "error", err)
+			http.Error(w, "invalid usage context", http.StatusBadRequest)
+			return
+		}
 		// Read a bounded body before proxying so oversize inputs never reach inference.
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
 		if err != nil {
@@ -147,7 +161,7 @@ func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits
 					Operation:        usage.Operation{Service: usage.ServiceRouter, Name: usage.OperationRouterModelRequest},
 					CustomerRequests: 1,
 					Meters:           []usage.Meter{{Name: usage.MeterInputTokens, Quantity: inputTokens}},
-					Attributes:       map[string]string{"model": billingModel, "route": redactPath, "streaming": "false"},
+					Attributes:       eventAttributes(contextAttributes),
 				})
 				resp.Header.Set(billableRequestsHeader, "1")
 			}
@@ -312,4 +326,49 @@ func probeHealth(ctx context.Context, client *http.Client, url string) error {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// usageContextAttributes verifies the parent's signed usage context, if any,
+// and returns the attributes it contributes to the usage event. No context
+// (a direct customer call) yields no attributes; a present but invalid one
+// is an error, as in websearch.
+func usageContextAttributes(header http.Header, apiKey, secret string) (map[string]string, error) {
+	if secret == "" {
+		return nil, nil
+	}
+	ctx, present, err := usage.FromHeaders(header, secret, time.Now(), usageContextMaxSkew)
+	if err != nil {
+		return nil, err
+	}
+	if !present {
+		return nil, nil
+	}
+	if !usage.VerifyAPIKeyHash(apiKey, ctx.APIKeyHash) {
+		return nil, errors.New("usage context api key mismatch")
+	}
+	if ctx.Depth > usageContextMaxDepth {
+		return nil, fmt.Errorf("usage context depth %d exceeds %d", ctx.Depth, usageContextMaxDepth)
+	}
+	attributes := map[string]string{}
+	if ctx.ContextID != "" {
+		attributes["context_id"] = ctx.ContextID
+	}
+	if ctx.RootRequestID != "" {
+		attributes["root_request_id"] = ctx.RootRequestID
+	}
+	if ctx.ParentService != "" {
+		attributes["parent_service"] = ctx.ParentService
+	}
+	if ctx.Depth > 0 {
+		attributes["depth"] = strconv.Itoa(ctx.Depth)
+	}
+	return attributes, nil
+}
+
+func eventAttributes(contextAttributes map[string]string) map[string]string {
+	attributes := map[string]string{"model": billingModel, "route": redactPath, "streaming": "false"}
+	for k, v := range contextAttributes {
+		attributes[k] = v
+	}
+	return attributes
 }

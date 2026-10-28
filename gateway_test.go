@@ -272,3 +272,59 @@ func TestWorkerKeepAliveOutlivesGatewayIdle(t *testing.T) {
 		t.Fatalf("gateway idle %v must be well under worker keep-alive %v", workerIdleConnTimeout, workerKeepAlive)
 	}
 }
+
+// A parent service's signed usage context rides onto the event as nesting
+// attributes; a forged or mismatched one is refused; none is a direct call.
+func TestGatewayPropagatesUsageContext(t *testing.T) {
+	const secret, apiKey = "ctx-secret", "tk_customer"
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(usage.HeaderContext) != "" || r.Header.Get(usage.HeaderUsageContextSignature) != "" {
+			t.Error("usage context reached model process")
+		}
+		w.Header().Set(inputTokensHeader, "3")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer backend.Close()
+	target, _ := url.Parse(backend.URL)
+	call := func(t *testing.T, sign func(http.Header)) (*recordedUsage, int) {
+		t.Helper()
+		reporter := &recordedUsage{}
+		handler := newGatewayWithUsageContext([]*url.URL{target}, reporter, testLimits, secret)
+		request := httptest.NewRequest(http.MethodPost, redactPath, strings.NewReader(`{"text":"hi"}`))
+		request.Header.Set("Authorization", "Bearer "+apiKey)
+		sign(request.Header)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return reporter, response.Code
+	}
+	parent := usage.Context{ContextID: "ctx-1", RootRequestID: "root-1", ParentService: usage.ServiceWebsearch, Depth: 2, BillCustomerRequest: true, APIKeyHash: usage.HashAPIKey(apiKey), IssuedAt: time.Now()}
+
+	reporter, code := call(t, func(h http.Header) {
+		if err := usage.SetHeaders(h, parent, secret); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if code != http.StatusOK || len(reporter.events) != 1 {
+		t.Fatalf("nested call: status %d, events %+v", code, reporter.events)
+	}
+	got := reporter.events[0].Attributes
+	if got["parent_service"] != usage.ServiceWebsearch || got["depth"] != "2" || got["root_request_id"] != "root-1" || got["context_id"] != "ctx-1" || got["model"] != billingModel {
+		t.Fatalf("attributes: %+v", got)
+	}
+
+	reporter, code = call(t, func(http.Header) {})
+	if code != http.StatusOK || len(reporter.events) != 1 || reporter.events[0].Attributes["parent_service"] != "" {
+		t.Fatalf("direct call: status %d, events %+v", code, reporter.events)
+	}
+
+	forged := parent
+	forged.APIKeyHash = usage.HashAPIKey("tk_other")
+	reporter, code = call(t, func(h http.Header) { _ = usage.SetHeaders(h, forged, secret) })
+	if code != http.StatusBadRequest || len(reporter.events) != 0 {
+		t.Fatalf("mismatched key hash: status %d, events %+v", code, reporter.events)
+	}
+	reporter, code = call(t, func(h http.Header) { _ = usage.SetHeaders(h, parent, "wrong-secret") })
+	if code != http.StatusBadRequest || len(reporter.events) != 0 {
+		t.Fatalf("bad signature: status %d, events %+v", code, reporter.events)
+	}
+}

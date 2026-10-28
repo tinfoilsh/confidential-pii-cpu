@@ -252,7 +252,7 @@ func run(ctx context.Context) error {
 		}(i, watchHealth(backendCtx, backendURL+healthPath, healthProbeInterval))
 	}
 
-	server := &http.Server{Addr: listenAddress, Handler: newGateway(targets, reporter, limits), ReadHeaderTimeout: headerTimeout, ReadTimeout: limits.maxRequest, IdleTimeout: limits.maxRequest}
+	server := &http.Server{Addr: listenAddress, Handler: newGatewayWithUsageContext(targets, reporter, limits, cfg.Secret), ReadHeaderTimeout: headerTimeout, ReadTimeout: limits.maxRequest, IdleTimeout: limits.maxRequest}
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.ListenAndServe() }()
 

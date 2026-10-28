@@ -5,6 +5,10 @@ import "time"
 const (
 	listenAddress = ":8001"
 	inferenceHost = "127.0.0.1"
+	// Signed usage context from a parent service: tolerated clock skew and
+	// the deepest nesting accepted (router -> websearch -> privacy filter).
+	usageContextMaxSkew  = 10 * time.Minute
+	usageContextMaxDepth = 4
 	// Catalog model name the usage event is billed under.
 	billingModel           = "pii-filter"
 	inferenceBasePort      = 8002
