@@ -8,11 +8,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	usage "github.com/tinfoilsh/usage-reporting-go"
 	usageclient "github.com/tinfoilsh/usage-reporting-go/client"
@@ -58,12 +58,157 @@ func workerCount() (int, error) {
 	return n, nil
 }
 
+// intEnv reads an integer environment variable that must be at least minimum.
+func intEnv(name string, fallback, minimum int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < minimum {
+		return 0, fmt.Errorf("%s must be an integer >= %d (got %q)", name, minimum, raw)
+	}
+	return n, nil
+}
+
+// forwardLimitsFromEnv sizes the forward scheduler and request deadlines:
+// one lane per worker may run at once (a worker process runs one forward
+// at a time: one interpreter, one torch pool, one rotary offset),
+// OPF_MAX_QUEUED_WINDOWS windows may wait for one, and a request is allowed
+// OPF_WINDOW_TIMEOUT_SECONDS per window (estimated with OPF_WINDOW_TOKENS /
+// OPF_WINDOW_OVERLAP, the geometry the workers use) up to
+// OPF_MAX_REQUEST_SECONDS. Each dispatched forward must finish within
+// OPF_FORWARD_TIMEOUT_SECONDS or its worker is considered wedged. Requests
+// of at most OPF_SHORT_REQUEST_TOKENS are short (priority); the hold rule
+// is OPF_SHORT_LANE_HORIZONS / OPF_SHORT_LANE_ARMED_SECONDS with the ETA
+// model seeded by OPF_MS_PER_TOKEN.
+func forwardLimitsFromEnv(workers int) (forwardLimits, error) {
+	var limits forwardLimits
+	var windowTimeout, maxRequest, forwardTimeout int
+	for _, retired := range []string{"OPF_MAX_CONCURRENCY", "OPF_FORWARD_FANOUT", "OPF_FORWARD_URL"} {
+		if os.Getenv(retired) != "" {
+			return forwardLimits{}, fmt.Errorf("%s is no longer a setting (one forward at a time per worker; windows go to the gateway /queue, OPF_QUEUE_URL)", retired)
+		}
+	}
+	for _, v := range []struct {
+		name              string
+		fallback, minimum int
+		into              *int
+	}{
+		{"OPF_MAX_QUEUED_WINDOWS", defaultMaxQueuedWindows, 1, &limits.maxQueued},
+		{"OPF_WINDOW_TOKENS", defaultWindowTokens, 1, &limits.windowTokens},
+		{"OPF_WINDOW_OVERLAP", defaultWindowOverlap, 0, &limits.windowOverlap},
+		{"OPF_WINDOW_TIMEOUT_SECONDS", int(defaultWindowTimeout / time.Second), 1, &windowTimeout},
+		{"OPF_MAX_REQUEST_SECONDS", int(defaultMaxRequest / time.Second), 1, &maxRequest},
+		{"OPF_FORWARD_TIMEOUT_SECONDS", int(defaultForwardTimeout / time.Second), 1, &forwardTimeout},
+	} {
+		n, err := intEnv(v.name, v.fallback, v.minimum)
+		if err != nil {
+			return forwardLimits{}, err
+		}
+		*v.into = n
+	}
+	if 2*limits.windowOverlap >= limits.windowTokens {
+		return forwardLimits{}, fmt.Errorf("OPF_WINDOW_TOKENS (%d) must exceed twice OPF_WINDOW_OVERLAP (%d)", limits.windowTokens, limits.windowOverlap)
+	}
+	shortTokens, err := intEnv("OPF_SHORT_REQUEST_TOKENS", limits.windowTokens, 1)
+	if err != nil {
+		return forwardLimits{}, err
+	}
+	limits.shortTokens = shortTokens
+	limits.maxInflight = workers
+	limits.windowTimeout = time.Duration(windowTimeout) * time.Second
+	limits.maxRequest = time.Duration(maxRequest) * time.Second
+	limits.forwardTimeout = time.Duration(forwardTimeout) * time.Second
+	if limits.horizons, err = secondsListEnv("OPF_SHORT_LANE_HORIZONS", defaultShortLaneHorizon); err != nil {
+		return forwardLimits{}, err
+	}
+	armed, err := secondsEnv("OPF_SHORT_LANE_ARMED_SECONDS", defaultShortLaneArmed)
+	if err != nil {
+		return forwardLimits{}, err
+	}
+	limits.armed = armed
+	if limits.longGrace, err = secondsEnv("OPF_LONG_GRACE_SECONDS", defaultLongGrace); err != nil {
+		return forwardLimits{}, err
+	}
+	if limits.msPerToken, err = floatEnv("OPF_MS_PER_TOKEN", defaultMsPerToken); err != nil {
+		return forwardLimits{}, err
+	}
+	return limits, nil
+}
+
+// floatEnv reads a positive floating-point environment variable.
+func floatEnv(name string, fallback float64) (float64, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v <= 0 {
+		return 0, fmt.Errorf("%s must be a positive number (got %q)", name, raw)
+	}
+	return v, nil
+}
+
+// secondsEnv reads a non-negative duration in seconds.
+// queueURLForWorkers is the gateway /queue endpoint handed to spawned
+// workers: OPF_QUEUE_URL when the deployment sets it, else this gateway's own.
+func queueURLForWorkers() string {
+	if raw := strings.TrimSpace(os.Getenv("OPF_QUEUE_URL")); raw != "" {
+		return raw
+	}
+	return "http://" + queueAddress + queuePath
+}
+
+func secondsEnv(name string, fallback time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative number of seconds (got %q)", name, raw)
+	}
+	return time.Duration(v * float64(time.Second)), nil
+}
+
+// secondsListEnv reads a comma-separated list of seconds. Empty or "0"
+// yields no entries (the hold rule off); the list must be non-decreasing
+// since entry k applies to the k-th soonest-freeing lane.
+func secondsListEnv(name, fallback string) ([]time.Duration, error) {
+	raw, set := os.LookupEnv(name)
+	if !set {
+		raw = fallback
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "0" {
+		return nil, nil
+	}
+	var out []time.Duration
+	for _, field := range strings.Split(raw, ",") {
+		v, err := strconv.ParseFloat(strings.TrimSpace(field), 64)
+		if err != nil || v < 0 {
+			return nil, fmt.Errorf("%s must be comma-separated seconds (got %q)", name, raw)
+		}
+		d := time.Duration(v * float64(time.Second))
+		if len(out) > 0 && d < out[len(out)-1] {
+			return nil, fmt.Errorf("%s must be non-decreasing (got %q)", name, raw)
+		}
+		out = append(out, d)
+	}
+	return out, nil
+}
+
 func run(ctx context.Context) error {
 	cfg, err := reportingConfig()
 	if err != nil {
 		return err
 	}
 	workers, err := workerCount()
+	if err != nil {
+		return err
+	}
+	limits, err := forwardLimitsFromEnv(workers)
 	if err != nil {
 		return err
 	}
@@ -77,51 +222,33 @@ func run(ctx context.Context) error {
 	backendCtx, stopBackend := context.WithCancel(context.Background())
 	defer stopBackend()
 
-	backendDone := make(chan error, workers)
-	unhealthy := make(chan error, workers)
 	targets := make([]*url.URL, workers)
-	backends := make([]*exec.Cmd, workers)
 	for i := range workers {
-		port := strconv.Itoa(inferenceBasePort + i)
-		backendURL := "http://" + inferenceHost + ":" + port
-		backend := exec.CommandContext(backendCtx, "uvicorn", "server:app", "--host", inferenceHost, "--port", port, "--no-access-log")
-		backend.Stdout, backend.Stderr = os.Stdout, os.Stderr
-		backend.Cancel = func() error { return backend.Process.Signal(syscall.SIGTERM) }
-		backend.WaitDelay = shutdownTimeout
-		if err := backend.Start(); err != nil {
-			stopBackend()
-			for _, started := range backends[:i] {
-				_ = started.Wait()
-			}
-			return fmt.Errorf("start inference worker %d: %w", i, err)
-		}
-		backends[i] = backend
-		go func(worker int, cmd *exec.Cmd) {
-			err := cmd.Wait()
-			backendDone <- fmt.Errorf("inference worker %d exited unexpectedly: %v", worker, err)
-		}(i, backend)
-		targets[i], _ = url.Parse(backendURL)
-		// Exiting on a wedged worker lets Docker's restart policy replace the
-		// whole set; an unhealthy state alone never triggers a restart.
-		go func(worker int, failed <-chan error) {
-			if err, ok := <-failed; ok {
-				unhealthy <- fmt.Errorf("inference worker %d unhealthy: %w", worker, err)
-			}
-		}(i, watchHealth(backendCtx, backendURL+healthPath, healthProbeInterval))
+		targets[i], _ = url.Parse("http://" + inferenceHost + ":" + strconv.Itoa(inferenceBasePort+i))
+	}
+	// The platform signs parent usage contexts with USAGE_CONTEXT_SECRET,
+	// distinct from this reporter's own secret. Optional until websearch
+	// sends one; absent means contexts are ignored (a direct call).
+	front := buildGateway(targets, reporter, limits, strings.TrimSpace(os.Getenv("USAGE_CONTEXT_SECRET")))
+	supervisor := newWorkerSupervisor(backendCtx, front.workers)
+	supervisor.onReady = front.resume
+	front.onWedge = supervisor.wedged
+	if err := supervisor.startAll(); err != nil {
+		stopBackend()
+		supervisor.stop()
+		return err
 	}
 
-	server := &http.Server{Addr: listenAddress, Handler: newGateway(targets, reporter), ReadHeaderTimeout: headerTimeout, ReadTimeout: inferenceTimeout, IdleTimeout: inferenceTimeout}
-	serverDone := make(chan error, 1)
+	server := &http.Server{Addr: listenAddress, Handler: front, ReadHeaderTimeout: headerTimeout, ReadTimeout: limits.maxRequest, IdleTimeout: limits.maxRequest}
+	queueServer := &http.Server{Addr: queueAddress, Handler: front.internal, ReadHeaderTimeout: headerTimeout, ReadTimeout: limits.maxRequest, IdleTimeout: limits.maxRequest}
+	serverDone := make(chan error, 2)
 	go func() { serverDone <- server.ListenAndServe() }()
+	go func() { serverDone <- queueServer.ListenAndServe() }()
 
 	var result error
-	backendsExited := 0
 	select {
 	case <-ctx.Done():
-	case err := <-backendDone:
-		backendsExited = 1
-		result = err
-	case err := <-unhealthy:
+	case err := <-supervisor.fatal:
 		result = err
 	case err := <-serverDone:
 		if !errors.Is(err, http.ErrServerClosed) {
@@ -134,9 +261,8 @@ func run(ctx context.Context) error {
 		_ = server.Close()
 		result = errors.Join(result, err)
 	}
+	_ = queueServer.Close() // the workers' window posts; nothing to drain
 	stopBackend()
-	for ; backendsExited < workers; backendsExited++ {
-		<-backendDone
-	}
+	supervisor.stop()
 	return result
 }

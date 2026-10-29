@@ -10,13 +10,12 @@ import (
 
 // watchHealth polls the inference server's health endpoint and reports on the
 // returned channel once it has failed healthFailureThreshold times in a row.
-// The first probe waits for the model to load, so startup never counts as a
-// failure.
-func watchHealth(ctx context.Context, url string, interval time.Duration) <-chan error {
+// Unless the caller has already seen the worker healthy (ready), failures
+// before the first success are the model loading, not a wedge.
+func watchHealth(ctx context.Context, url string, interval time.Duration, ready bool) <-chan error {
 	failed := make(chan error, 1)
 	go func() {
 		client := &http.Client{Timeout: healthProbeTimeout}
-		ready := false
 		failures := 0
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()

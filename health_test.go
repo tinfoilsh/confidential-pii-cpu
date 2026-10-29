@@ -20,7 +20,7 @@ func TestWatchHealthExitsOnlyAfterReadyThenRepeatedFailure(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	unhealthy := watchHealth(ctx, backend.URL+healthPath, interval)
+	unhealthy := watchHealth(ctx, backend.URL+healthPath, interval, false)
 
 	// Failing before the model has ever loaded is startup, not a wedge.
 	select {

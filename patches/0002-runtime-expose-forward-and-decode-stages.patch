@@ -1,0 +1,106 @@
+diff --git a/usr/local/lib/python3.12/site-packages/opf/_core/runtime.py b/usr/local/lib/python3.12/site-packages/opf/_core/runtime.py
+index 2c3034e..906c09a 100644
+--- a/usr/local/lib/python3.12/site-packages/opf/_core/runtime.py
++++ b/usr/local/lib/python3.12/site-packages/opf/_core/runtime.py
+@@ -254,6 +254,38 @@ def load_inference_runtime(
+     )
+ 
+ 
++def encode_text(runtime: InferenceRuntime, text: str) -> tuple[int, ...]:
++    """Tokenize one text exactly as `predict_text` does."""
++    return tuple(
++        int(tok) for tok in runtime.encoding.encode(text, allowed_special="all")
++    )
++
++
++@torch.inference_mode()
++def forward_window(
++    runtime: InferenceRuntime,
++    tokens: Sequence[int],
++) -> torch.Tensor:
++    """Run one window of token ids through the model.
++
++    Returns a `[len(tokens), num_classes]` float32 CPU tensor of per-token
++    class log-probabilities, the unit `predict_text` aggregates across
++    windows. Exposed so callers can run windows elsewhere (another process,
++    a worker pool) and feed the results to `decode_token_scores`.
++    """
++    window_tokens = torch.tensor(
++        [list(tokens)],
++        device=runtime.device,
++        dtype=torch.int32,
++    )
++    attention_mask = torch.ones_like(window_tokens, dtype=torch.bool)
++    logits = runtime.model(window_tokens, attention_mask=attention_mask)
++    log_probs = F.log_softmax(logits.float(), dim=-1)[0].cpu()
++    if log_probs.shape[0] != len(tokens):
++        raise ValueError("Logprob output length does not match window length")
++    return log_probs
++
++
+ @torch.inference_mode()
+ def predict_text(
+     runtime: InferenceRuntime,
+@@ -262,9 +294,7 @@ def predict_text(
+     decoder: ViterbiCRFDecoder | None,
+ ) -> PredictionResult:
+     """Run one text through the model and return decoded detected spans."""
+-    token_ids = tuple(
+-        int(tok) for tok in runtime.encoding.encode(text, allowed_special="all")
+-    )
++    token_ids = encode_text(runtime, text)
+     if not token_ids:
+         return PredictionResult(text=text, spans=(), decoded_mismatch=False)
+ 
+@@ -286,16 +316,7 @@ def predict_text(
+     ):
+         if not window.tokens:
+             continue
+-        window_tokens = torch.tensor(
+-            [list(window.tokens)],
+-            device=runtime.device,
+-            dtype=torch.int32,
+-        )
+-        attention_mask = torch.ones_like(window_tokens, dtype=torch.bool)
+-        logits = runtime.model(window_tokens, attention_mask=attention_mask)
+-        log_probs = F.log_softmax(logits.float(), dim=-1)[0].cpu()
+-        if log_probs.shape[0] != len(window.tokens):
+-            raise ValueError("Logprob output length does not match window length")
++        log_probs = forward_window(runtime, window.tokens)
+ 
+         for token_pos, is_valid in enumerate(window.mask):
+             if not bool(is_valid):
+@@ -335,6 +356,33 @@ def predict_text(
+         return PredictionResult(text=text, spans=(), decoded_mismatch=False)
+ 
+     stacked_scores = torch.stack(token_score_vectors, dim=0)
++    return decode_token_scores(
++        runtime,
++        text,
++        token_ids,
++        token_positions,
++        stacked_scores,
++        decoder=decoder,
++    )
++
++
++@torch.inference_mode()
++def decode_token_scores(
++    runtime: InferenceRuntime,
++    text: str,
++    token_ids: Sequence[int],
++    token_positions: Sequence[int],
++    stacked_scores: torch.Tensor,
++    *,
++    decoder: ViterbiCRFDecoder | None,
++) -> PredictionResult:
++    """Decode aggregated per-token scores into detected character spans.
++
++    `stacked_scores` is `[len(token_positions), num_classes]`; row i holds
++    the (window-averaged) log-probabilities of token `token_positions[i]`
++    of `token_ids`. This is the second half of `predict_text`: one Viterbi
++    decode over the whole sequence, then token spans to character spans.
++    """
+     if decoder is not None:
+         decoded_labels = decoder.decode(stacked_scores)
+         if len(decoded_labels) != len(token_positions):

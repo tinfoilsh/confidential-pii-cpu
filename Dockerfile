@@ -38,7 +38,7 @@ RUN set -eux; \
 # The cache file is named by sha1(url) — deterministic, never changes.
 COPY tiktoken_cache /app/tiktoken_cache
 
-COPY server.py /app/server.py
+COPY server.py chunking.py /app/
 COPY --from=billing-build /privacy-filter /usr/local/bin/privacy-filter
 
 WORKDIR /app
@@ -46,10 +46,14 @@ WORKDIR /app
 ENV OPF_DEVICE=cpu \
     TIKTOKEN_CACHE_DIR=/app/tiktoken_cache \
     OPF_NUM_THREADS=16 \
-    OPF_MAX_CONCURRENCY=1 \
-    OPF_MAX_INPUT_TOKENS=8192 \
-    OPF_MAX_QUEUE_DEPTH=64 \
-    OPF_WORKERS=1
+    OPF_WORKERS=1 \
+    OPF_WINDOW_TOKENS=6144 \
+    OPF_WINDOW_OVERLAP=1024 \
+    OPF_QUEUE_URL=http://127.0.0.1:8000/queue \
+    OPF_MAX_QUEUED_WINDOWS=4096 \
+    OPF_WINDOW_TIMEOUT_SECONDS=5 \
+    OPF_MAX_REQUEST_SECONDS=900 \
+    OPF_FORWARD_TIMEOUT_SECONDS=30
 
 EXPOSE 8001
 
