@@ -48,6 +48,11 @@ type workerProc struct {
 	cmd         *exec.Cmd
 	cancelWatch context.CancelFunc
 	exited      chan struct{}
+	// ready is closed once the process has answered /health (or boot gave
+	// up: bootErr is then set). The health watcher owns boot; replace waits
+	// on it.
+	ready   chan struct{}
+	bootErr error
 	// expected marks an exit the supervisor caused (restart or shutdown).
 	expected bool
 }
@@ -98,7 +103,7 @@ func (s *workerSupervisor) spawn(i int) error {
 		return err
 	}
 	watchCtx, cancelWatch := context.WithCancel(s.ctx)
-	proc := &workerProc{cmd: cmd, cancelWatch: cancelWatch, exited: make(chan struct{})}
+	proc := &workerProc{cmd: cmd, cancelWatch: cancelWatch, exited: make(chan struct{}), ready: make(chan struct{})}
 	s.mu.Lock()
 	s.procs[i] = proc
 	s.mu.Unlock()
@@ -114,7 +119,15 @@ func (s *workerSupervisor) spawn(i int) error {
 		}
 	}()
 	go func() {
-		if err, ok := <-watchHealth(watchCtx, s.url(i)+healthPath, s.probeInterval()); ok {
+		// Probes count only once the worker has answered /health once:
+		// loading the model takes longer than healthFailureThreshold probes
+		// and a worker killed mid-load would only load again.
+		proc.bootErr = s.awaitReady(watchCtx, i)
+		close(proc.ready)
+		if proc.bootErr != nil {
+			return // replace (or shutdown) handles it
+		}
+		if err, ok := <-watchHealth(watchCtx, s.url(i)+healthPath, s.probeInterval(), true); ok {
 			s.replace(i, fmt.Errorf("health probes failed: %w", err))
 		}
 	}()
@@ -175,8 +188,8 @@ func (s *workerSupervisor) replace(i int, reason error) {
 		s.fail(fmt.Errorf("respawn inference worker %d: %w", i, err))
 		return
 	}
-	if err := s.awaitReady(i); err != nil {
-		s.fail(fmt.Errorf("inference worker %d did not become healthy after restart: %w", i, err))
+	if err := s.booted(i); err != nil {
+		s.fail(fmt.Errorf("after restart: %w", err))
 		return
 	}
 	s.workers[i].wedged.Store(false)
@@ -184,6 +197,16 @@ func (s *workerSupervisor) replace(i int, reason error) {
 	if s.onReady != nil {
 		s.onReady(i)
 	}
+}
+
+// booted waits for worker i's current process to answer /health, or for
+// its boot to give up.
+func (s *workerSupervisor) booted(i int) error {
+	s.mu.Lock()
+	proc := s.procs[i]
+	s.mu.Unlock()
+	<-proc.ready
+	return proc.bootErr
 }
 
 // probeInterval is the health-watch cadence; tests shorten it.
@@ -194,7 +217,7 @@ func (s *workerSupervisor) probeInterval() time.Duration {
 	return healthProbeInterval
 }
 
-func (s *workerSupervisor) awaitReady(i int) error {
+func (s *workerSupervisor) awaitReady(ctx context.Context, i int) error {
 	client := &http.Client{Timeout: healthProbeTimeout}
 	bootTimeout := s.bootTimeout
 	if bootTimeout == 0 {
@@ -203,15 +226,15 @@ func (s *workerSupervisor) awaitReady(i int) error {
 	deadline := time.Now().Add(bootTimeout)
 	var last error
 	for time.Now().Before(deadline) {
-		if s.ctx.Err() != nil {
-			return s.ctx.Err()
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		if last = probe(s.ctx, client, s.url(i)+healthPath); last == nil {
+		if last = probe(ctx, client, s.url(i)+healthPath); last == nil {
 			return nil
 		}
 		time.Sleep(time.Second)
 	}
-	return last
+	return fmt.Errorf("inference worker %d did not become healthy within %s: %w", i, bootTimeout, last)
 }
 
 func (s *workerSupervisor) fail(err error) {

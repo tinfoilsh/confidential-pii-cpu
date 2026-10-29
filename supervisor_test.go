@@ -81,7 +81,7 @@ func fakeSupervisor(t *testing.T, n int, sickFile string) (*workerSupervisor, []
 		t.Fatal(err)
 	}
 	for i := range workers {
-		if err := s.awaitReady(i); err != nil {
+		if err := s.booted(i); err != nil {
 			cancel()
 			t.Fatal(err)
 		}
@@ -220,5 +220,44 @@ func TestSupervisorStopIsNotFatal(t *testing.T) {
 	}
 	if !errors.Is(s.ctx.Err(), context.Canceled) {
 		t.Fatal("context not cancelled")
+	}
+}
+
+// A worker that is slow to boot is left alone: probes do not count until it
+// has answered /health once, so a long model load is not mistaken for a
+// sick worker.
+func TestSupervisorDoesNotProbeAWorkerStillBooting(t *testing.T) {
+	sick := t.TempDir() + "/sick"
+	if err := os.WriteFile(sick, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	target, _ := url.Parse("http://" + inferenceHost)
+	s := newWorkerSupervisor(ctx, []*worker{{target: target}})
+	s.basePort = freePortBase(t, 1)
+	s.interval = 20 * time.Millisecond // 3 failures would land in 60ms
+	s.bootTimeout = 5 * time.Second
+	s.command = func(ctx context.Context, i int, port string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, os.Args[0])
+		cmd.Env = append(os.Environ(), "PII_FAKE_WORKER_PORT="+port, "PII_FAKE_WORKER_SICK="+sick)
+		return cmd
+	}
+	if err := s.startAll(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cancel(); s.stop() })
+	pid := pidOf(s, 0)
+	time.Sleep(500 * time.Millisecond) // many probe intervals while "booting"
+	if pidOf(s, 0) != pid {
+		t.Fatal("booting worker was replaced")
+	}
+	_ = os.Remove(sick)
+	if err := s.booted(0); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-s.fatal:
+		t.Fatalf("boot reported fatal: %v", err)
+	default:
 	}
 }
