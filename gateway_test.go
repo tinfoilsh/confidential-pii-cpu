@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -326,5 +327,104 @@ func TestGatewayPropagatesUsageContext(t *testing.T) {
 	reporter, code = call(t, func(h http.Header) { _ = usage.SetHeaders(h, parent, "wrong-secret") })
 	if code != http.StatusBadRequest || len(reporter.events) != 0 {
 		t.Fatalf("bad signature: status %d, events %+v", code, reporter.events)
+	}
+}
+
+// A coordinator that posts a request's windows must stop when the /redact
+// ends: here the client goes away mid-request, and the windows still queued
+// for that request are refused (409) instead of running, while another
+// request's window is untouched.
+func TestGatewayCancelsQueuedWindowsWhenRedactEnds(t *testing.T) {
+	// One lane, held busy for a while by a window of an unrelated request so
+	// everything else queues behind it.
+	lane := newFakeWorker(t, 2*time.Second)
+	workerSawRequestID := make(chan string, 1)
+	// The "coordinator" backend: records the request id the gateway minted
+	// and hangs until the client gives up.
+	coordinator := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == redactPath {
+			_, _ = io.Copy(io.Discard, r.Body) // read, as a real worker does; the server only watches for disconnects after
+			workerSawRequestID <- r.Header.Get(requestIDHeader)
+			<-r.Context().Done()
+			return
+		}
+		lane.server.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer coordinator.Close()
+	target, _ := url.Parse(coordinator.URL)
+	gateway := httptest.NewServer(newGateway([]*url.URL{target}, &recordedUsage{}, limitsWith(1, 64)))
+	defer gateway.Close()
+
+	// Occupy the lane.
+	go forwardWindow(t, gateway.URL, "someone", 1, 1_000_000)
+	waitFor(t, func() bool { return lane.busy.Load() == 1 })
+
+	// Client starts a /redact, then disconnects.
+	ctx, cancelClient := context.WithCancel(context.Background())
+	redact, _ := http.NewRequestWithContext(ctx, http.MethodPost, gateway.URL+redactPath, strings.NewReader(`{"text":"long"}`))
+	redact.Header.Set("Authorization", "Bearer tk_customer")
+	go func() { _, _ = http.DefaultClient.Do(redact) }()
+	requestID := <-workerSawRequestID
+	if requestID == "" {
+		t.Fatal("coordinator was not told the request id")
+	}
+
+	// The coordinator posts two windows of that request and one of another;
+	// all queue behind the busy lane.
+	type result struct{ status int }
+	results := make(chan result, 3)
+	post := func(id string) {
+		req, _ := http.NewRequest(http.MethodPost, gateway.URL+forwardPath, bytes.NewReader(make([]byte, 4)))
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set(keyHashHeader, "caller")
+		req.Header.Set(requestIDHeader, id)
+		req.Header.Set(requestTokensHeader, "1000000")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			results <- result{0}
+			return
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		results <- result{resp.StatusCode}
+	}
+	go post(requestID)
+	go post(requestID)
+	go post("other-request")
+	waitFor(t, func() bool { return lane.calls.Load() == 1 }) // nothing else dispatched
+	time.Sleep(50 * time.Millisecond)
+
+	cancelClient()
+	got := map[int]int{}
+	for range 2 {
+		select {
+		case r := <-results:
+			got[r.status]++
+		case <-time.After(5 * time.Second):
+			t.Fatal("cancelled request's windows were not refused")
+		}
+	}
+	if got[http.StatusConflict] != 2 {
+		t.Fatalf("expected two 409s for the ended request, got %v", got)
+	}
+	// The other request's window is untouched: it runs once the lane frees.
+	select {
+	case r := <-results:
+		if r.status != http.StatusOK {
+			t.Fatalf("the other request's window was disturbed: %v", r)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the other request's window never ran")
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met in time")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

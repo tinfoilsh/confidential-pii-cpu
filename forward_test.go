@@ -463,13 +463,21 @@ func TestForwardLimitsFromEnv(t *testing.T) {
 		t.Fatal("accepted decreasing horizons")
 	}
 	t.Setenv("OPF_SHORT_LANE_HORIZONS", "")
-	t.Setenv("OPF_MAX_CONCURRENCY", "2")
+	// Retired knobs are refused rather than ignored, so an old config
+	// cannot silently reintroduce them.
+	for _, retired := range []string{"OPF_MAX_CONCURRENCY", "OPF_FORWARD_FANOUT"} {
+		t.Setenv(retired, "2")
+		if _, err := forwardLimitsFromEnv(4); err == nil {
+			t.Fatalf("accepted retired setting %s", retired)
+		}
+		t.Setenv(retired, "")
+	}
 	t.Setenv("OPF_MAX_QUEUED_WINDOWS", "16")
 	t.Setenv("OPF_WINDOW_TOKENS", "4096")
 	t.Setenv("OPF_WINDOW_TIMEOUT_SECONDS", "3")
 	t.Setenv("OPF_MAX_REQUEST_SECONDS", "600")
 	limits, err = forwardLimitsFromEnv(4)
-	if err != nil || limits.maxInflight != 8 || limits.maxQueued != 16 || limits.windowTokens != 4096 || limits.windowTimeout != 3*time.Second || limits.maxRequest != 10*time.Minute {
+	if err != nil || limits.maxInflight != 4 || limits.maxQueued != 16 || limits.windowTokens != 4096 || limits.windowTimeout != 3*time.Second || limits.maxRequest != 10*time.Minute {
 		t.Fatalf("configured: %+v, %v", limits, err)
 	}
 	t.Setenv("OPF_WINDOW_OVERLAP", "2048")
@@ -493,5 +501,83 @@ func TestForwardURLForWorkersDefaultsToGateway(t *testing.T) {
 	t.Setenv("OPF_FORWARD_URL", "http://127.0.0.1:9999/forward")
 	if got := forwardURLForWorkers(); got != "http://127.0.0.1:9999/forward" {
 		t.Fatalf("override forward url: %q", got)
+	}
+}
+
+// A pure scheduler test: cancelling a request drops only its queued windows
+// (both classes), wakes their waiters with a nil lane, leaves windows already
+// on a lane and other requests' windows alone, and refills the freed slots.
+func TestSchedulerCancelRequestDropsOnlyThatRequestsQueue(t *testing.T) {
+	workers := []*worker{{target: &url.URL{Host: "w0"}}, {target: &url.URL{Host: "w1"}}}
+	s := newForwardScheduler(workers, limitsWith(2, 64))
+	// Two lanes: the first two windows of request A run at once.
+	a1, _ := s.enqueue("key", "A", 100, false)
+	a2, _ := s.enqueue("key", "A", 100, false)
+	a3, _ := s.enqueue("key", "A", 100, false)   // queued (long)
+	aShort, _ := s.enqueue("key", "A", 10, true) // queued (short class)
+	b1, _ := s.enqueue("key", "B", 100, false)   // same caller, other request
+	c1, _ := s.enqueue("other", "C", 100, false) // other caller
+	for _, running := range []*forwardItem{a1, a2} {
+		if <-running.ready == nil {
+			t.Fatal("running window lost its lane")
+		}
+	}
+	if s.queued != 4 || s.inflight != 2 {
+		t.Fatalf("queued %d inflight %d", s.queued, s.inflight)
+	}
+	if dropped := s.cancelRequest("A"); dropped != 2 {
+		t.Fatalf("dropped %d windows of A, want 2", dropped)
+	}
+	for _, cancelled := range []*forwardItem{a3, aShort} {
+		select {
+		case lane := <-cancelled.ready:
+			if lane != nil {
+				t.Fatal("cancelled window was given a lane")
+			}
+		default:
+			t.Fatal("cancelled window was not woken")
+		}
+	}
+	if s.queued != 2 || s.inflight != 2 {
+		t.Fatalf("after cancel: queued %d inflight %d", s.queued, s.inflight)
+	}
+	// Releasing A's running lanes dispatches B then C, in caller round-robin.
+	s.release(s.lanes[0], true)
+	s.release(s.lanes[1], true)
+	for _, next := range []*forwardItem{b1, c1} {
+		select {
+		case lane := <-next.ready:
+			if lane == nil {
+				t.Fatal("surviving window was cancelled")
+			}
+		default:
+			t.Fatal("surviving window not dispatched after lanes freed")
+		}
+	}
+	if s.cancelRequest("A") != 0 || s.cancelRequest("") != 0 {
+		t.Fatal("cancelling an absent request dropped something")
+	}
+}
+
+// Within the short class callers are served round-robin too: one caller
+// streaming many short requests cannot starve another caller's short one.
+func TestSchedulerShortClassIsFairAcrossCallers(t *testing.T) {
+	workers := []*worker{{target: &url.URL{Host: "w0"}}}
+	s := newForwardScheduler(workers, limitsWith(1, 64))
+	first, _ := s.enqueue("chatty", "r0", 10, true) // takes the only lane
+	<-first.ready
+	var chatty []*forwardItem
+	for i := range 5 {
+		item, _ := s.enqueue("chatty", "r"+strconv.Itoa(i+1), 10, true)
+		chatty = append(chatty, item)
+	}
+	quiet, _ := s.enqueue("quiet", "q", 10, true)
+	s.release(s.lanes[0], true) // next dispatch: chatty[0] (its turn), then quiet
+	<-chatty[0].ready
+	s.release(s.lanes[0], true)
+	select {
+	case <-quiet.ready:
+	default:
+		t.Fatal("the quiet caller's short window waited behind the chatty caller's backlog")
 	}
 }

@@ -89,6 +89,7 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 					r.Out.Header.Del(billableInputTokensHeader)
 					r.Out.Header.Del("Accept-Encoding")
 					r.Out.Header.Del(keyHashHeader)
+					r.Out.Header.Del(requestIDHeader)
 					r.Out.Header.Del(inputTokensHeader)
 				},
 				ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -134,10 +135,14 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 		picked.inflight.Add(1)
 		defer picked.inflight.Add(-1)
 		requestProxy := *picked.proxy
-		baseRewrite, hash := picked.proxy.Rewrite, keyHash(parts[1])
+		baseRewrite, hash, requestID := picked.proxy.Rewrite, keyHash(parts[1]), uuid.NewString()
+		// Whatever ends this request - answered, deadline, client gone -
+		// nothing of it stays queued for a lane.
+		defer scheduler.cancelRequest(requestID)
 		requestProxy.Rewrite = func(pr *httputil.ProxyRequest) {
 			baseRewrite(pr)
 			pr.Out.Header.Set(keyHashHeader, hash)
+			pr.Out.Header.Set(requestIDHeader, requestID)
 		}
 		requestProxy.ModifyResponse = func(resp *http.Response) error {
 			resp.Header.Del(billableRequestsHeader)
@@ -158,7 +163,7 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 				// pii-filter:redact per-request entry is the fallback for
 				// enclaves that predate the token meter.
 				reporter.AddEvent(usage.Event{
-					RequestID:        uuid.NewString(),
+					RequestID:        requestID,
 					APIKey:           parts[1],
 					Operation:        usage.Operation{Service: usage.ServiceRouter, Name: usage.OperationRouterModelRequest},
 					CustomerRequests: 1,
@@ -189,7 +194,7 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 		// coordinator's header (absent → long, the conservative reading).
 		requestTokens, _ := strconv.Atoi(r.Header.Get(requestTokensHeader))
 		short := requestTokens > 0 && requestTokens <= limits.shortTokens
-		item, err := scheduler.enqueue(r.Header.Get(keyHashHeader), len(body)/4, short)
+		item, err := scheduler.enqueue(r.Header.Get(keyHashHeader), r.Header.Get(requestIDHeader), len(body)/4, short)
 		if err != nil {
 			http.Error(w, "privacy filter is at capacity", http.StatusServiceUnavailable)
 			return
@@ -201,9 +206,17 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 		case slot = <-item.ready:
 		case <-ctx.Done():
 			if !scheduler.cancel(item) {
-				scheduler.release(<-item.ready, false)
+				if assigned := <-item.ready; assigned != nil {
+					scheduler.release(assigned, false)
+				}
 			}
 			http.Error(w, "privacy filter is at capacity", http.StatusServiceUnavailable)
+			return
+		}
+		if slot == nil {
+			// The /redact this window belongs to has ended; the coordinator
+			// is being torn down and nothing of it should run.
+			http.Error(w, "request no longer active", http.StatusConflict)
 			return
 		}
 		picked := slot.worker

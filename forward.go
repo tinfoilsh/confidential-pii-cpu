@@ -15,7 +15,7 @@ import (
 // forwardLimits bounds the forward scheduler and sizes request deadlines.
 type forwardLimits struct {
 	// maxInflight is the number of model forward passes the workers can run
-	// at once (workers × their per-process concurrency): the lane count.
+	// at once (one per worker): the lane count.
 	maxInflight int
 	// maxQueued is how many windows may wait for a lane before new ones are
 	// refused.
@@ -61,10 +61,89 @@ type lane struct {
 // was assigned; the sender never blocks because the channel holds one.
 type forwardItem struct {
 	key        string
+	request    string // the /redact request this window belongs to
 	tokens     int
 	short      bool
-	ready      chan *lane
+	ready      chan *lane // receives the lane, or nil when the request was cancelled
 	enqueuedAt time.Time
+}
+
+// callerQueue holds waiting windows grouped by caller and served round-robin
+// across callers, FIFO within one: a caller's windows only ever wait behind
+// its own. Both the short and the long class use one.
+type callerQueue struct {
+	queues map[string][]*forwardItem
+	keys   []string // callers with queued windows, round-robin order
+	next   int      // index into keys of the caller served next
+	size   int
+}
+
+func newCallerQueue() *callerQueue {
+	return &callerQueue{queues: make(map[string][]*forwardItem)}
+}
+
+func (q *callerQueue) push(item *forwardItem) {
+	if _, pending := q.queues[item.key]; !pending {
+		q.keys = append(q.keys, item.key)
+	}
+	q.queues[item.key] = append(q.queues[item.key], item)
+	q.size++
+}
+
+// peek returns the window to dispatch next and the function that removes it.
+func (q *callerQueue) peek() (*forwardItem, func()) {
+	key := q.keys[q.next]
+	queue := q.queues[key]
+	item := queue[0]
+	return item, func() {
+		q.size--
+		if len(queue) == 1 {
+			// Removing the current key shifts the next caller into this slot,
+			// so the cursor stays put.
+			q.dropKey(key)
+			return
+		}
+		q.queues[key] = queue[1:]
+		q.next = (q.next + 1) % len(q.keys)
+	}
+}
+
+// remove withdraws every window matching keep==false and returns them.
+func (q *callerQueue) remove(drop func(*forwardItem) bool) []*forwardItem {
+	var removed []*forwardItem
+	for _, key := range append([]string(nil), q.keys...) {
+		kept := q.queues[key][:0]
+		for _, item := range q.queues[key] {
+			if drop(item) {
+				removed = append(removed, item)
+			} else {
+				kept = append(kept, item)
+			}
+		}
+		if len(kept) == 0 {
+			q.dropKey(key)
+		} else {
+			q.queues[key] = kept
+		}
+	}
+	q.size -= len(removed)
+	return removed
+}
+
+func (q *callerQueue) dropKey(key string) {
+	delete(q.queues, key)
+	for i, k := range q.keys {
+		if k == key {
+			q.keys = append(q.keys[:i], q.keys[i+1:]...)
+			if i < q.next {
+				q.next--
+			}
+			break
+		}
+	}
+	if len(q.keys) == 0 || q.next >= len(q.keys) {
+		q.next = 0
+	}
 }
 
 // shortWaitBuckets are the upper bounds (seconds) of the short-window
@@ -75,21 +154,21 @@ type forwardItem struct {
 var shortWaitBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10}
 
 // forwardScheduler hands windows to lanes. Short requests' windows are
-// served first, FIFO. Long requests each have a FIFO queue keyed by the
-// caller hash the /redact proxy stamps on its request; the scheduler
-// round-robins across those callers and sends each window to the worker
-// with the fewest forwards in flight. The hold rule (see forwardLimits)
-// keeps a lane predicted to free soon so a short request arriving mid-way
-// through long documents waits about a horizon, not a whole window.
+// served before long ones; within each class callers (the hash the /redact
+// proxy stamps on its request) are served round-robin, FIFO per caller, and
+// each window goes to the worker with the fewest forwards in flight. A
+// coordinator posts every window of a request at once; when the request
+// ends (answered, timed out, or the client gone) the gateway cancels its
+// queued windows here. The hold rule (see forwardLimits) keeps a lane
+// predicted to free soon so a short request arriving mid-way through long
+// documents waits about a horizon, not a whole window.
 type forwardScheduler struct {
 	mu       sync.Mutex
 	lanes    []*lane
 	workers  []*worker
 	limits   forwardLimits
-	short    []*forwardItem
-	queues   map[string][]*forwardItem
-	keys     []string // long-request callers with queued windows, round-robin order
-	next     int      // index into keys of the caller served next
+	short    *callerQueue
+	long     *callerQueue
 	queued   int
 	inflight int
 
@@ -118,7 +197,8 @@ func newForwardScheduler(workers []*worker, limits forwardLimits) *forwardSchedu
 	s := &forwardScheduler{
 		workers:    workers,
 		limits:     limits,
-		queues:     make(map[string][]*forwardItem),
+		short:      newCallerQueue(),
+		long:       newCallerQueue(),
 		msPerToken: limits.msPerToken,
 		now:        time.Now,
 	}
@@ -128,25 +208,23 @@ func newForwardScheduler(workers []*worker, limits forwardLimits) *forwardSchedu
 	return s
 }
 
-// enqueue registers a window. tokens is the window's length (for the ETA
-// model); short marks a window of a short request. It fails when the queue
-// budget is exhausted: nothing queued now could finish inside the request
-// ceiling anyway, so refusing early is kinder than timing out later.
-func (s *forwardScheduler) enqueue(key string, tokens int, short bool) (*forwardItem, error) {
+// enqueue registers a window of request for caller key. tokens is the
+// window's length (for the ETA model); short marks a window of a short
+// request. It fails when the queue budget is exhausted: nothing queued now
+// could finish inside the request ceiling anyway, so refusing early is
+// kinder than timing out later.
+func (s *forwardScheduler) enqueue(key, request string, tokens int, short bool) (*forwardItem, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.queued >= s.limits.maxQueued {
 		return nil, errForwardQueueFull
 	}
-	item := &forwardItem{key: key, tokens: tokens, short: short, ready: make(chan *lane, 1), enqueuedAt: s.now()}
+	item := &forwardItem{key: key, request: request, tokens: tokens, short: short, ready: make(chan *lane, 1), enqueuedAt: s.now()}
 	if short {
 		s.lastShort = s.now()
-		s.short = append(s.short, item)
+		s.short.push(item)
 	} else {
-		if _, pending := s.queues[key]; !pending {
-			s.keys = append(s.keys, key)
-		}
-		s.queues[key] = append(s.queues[key], item)
+		s.long.push(item)
 	}
 	s.queued++
 	s.dispatchLocked()
@@ -159,31 +237,35 @@ func (s *forwardScheduler) enqueue(key string, tokens int, short bool) (*forward
 func (s *forwardScheduler) cancel(item *forwardItem) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	class := s.long
 	if item.short {
-		for i, queued := range s.short {
-			if queued == item {
-				s.short = append(s.short[:i], s.short[i+1:]...)
-				s.queued--
-				return true
-			}
-		}
-		return false
+		class = s.short
 	}
-	queue := s.queues[item.key]
-	for i, queued := range queue {
-		if queued != item {
-			continue
-		}
-		queue = append(queue[:i], queue[i+1:]...)
-		s.queued--
-		if len(queue) == 0 {
-			s.dropKeyLocked(item.key)
-		} else {
-			s.queues[item.key] = queue
-		}
-		return true
+	removed := class.remove(func(queued *forwardItem) bool { return queued == item })
+	s.queued -= len(removed)
+	return len(removed) == 1
+}
+
+// cancelRequest withdraws every queued window of a request whose /redact has
+// ended, waking their /forward handlers with a nil lane. Windows already on
+// a lane finish; nothing else of the request runs. Returns how many were
+// dropped.
+func (s *forwardScheduler) cancelRequest(request string) int {
+	if request == "" {
+		return 0
 	}
-	return false
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	drop := func(item *forwardItem) bool { return item.request == request }
+	removed := append(s.short.remove(drop), s.long.remove(drop)...)
+	s.queued -= len(removed)
+	for _, item := range removed {
+		item.ready <- nil
+	}
+	if len(removed) > 0 {
+		s.dispatchLocked()
+	}
+	return len(removed)
 }
 
 // release returns a lane, feeds the ETA model with the observed speed when
@@ -291,23 +373,10 @@ func (s *forwardScheduler) dispatchLocked() {
 // nextLocked peeks the window to dispatch next and returns the function that
 // removes it from its queue.
 func (s *forwardScheduler) nextLocked() (*forwardItem, func()) {
-	if len(s.short) > 0 {
-		item := s.short[0]
-		return item, func() { s.short = s.short[1:] }
+	if s.short.size > 0 {
+		return s.short.peek()
 	}
-	key := s.keys[s.next]
-	queue := s.queues[key]
-	item := queue[0]
-	return item, func() {
-		if len(queue) == 1 {
-			// Removing the current key shifts the next caller into this slot,
-			// so the cursor stays put.
-			s.dropKeyLocked(key)
-			return
-		}
-		s.queues[key] = queue[1:]
-		s.next = (s.next + 1) % len(s.keys)
-	}
+	return s.long.peek()
 }
 
 func (s *forwardScheduler) holdActiveLocked() bool {
@@ -371,24 +440,6 @@ func (s *forwardScheduler) freeLaneLocked() *lane {
 		}
 	}
 	return best
-}
-
-func (s *forwardScheduler) dropKeyLocked(key string) {
-	delete(s.queues, key)
-	for i, k := range s.keys {
-		if k == key {
-			s.keys = append(s.keys[:i], s.keys[i+1:]...)
-			if i < s.next {
-				s.next--
-			}
-			break
-		}
-	}
-	if len(s.keys) == 0 {
-		s.next = 0
-	} else {
-		s.next %= len(s.keys)
-	}
 }
 
 // requestTimeout scales the /redact deadline with the input size, estimated

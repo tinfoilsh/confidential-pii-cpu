@@ -75,7 +75,6 @@ def stubbed(monkeypatch):
     monkeypatch.setattr(server, "WINDOW_TOKENS", 1024)
     monkeypatch.setattr(server, "WINDOW_OVERLAP", 128)
     monkeypatch.setattr(server, "FORWARD_URL", None)
-    monkeypatch.setattr(server, "FORWARD_FANOUT", 4)
     monkeypatch.setattr(server, "_forward_client", None)
     return finisher
 
@@ -190,6 +189,7 @@ def remote(stubbed, monkeypatch):
         peak = 0
 
     seen = Seen()
+    seen.request_ids = set()
 
     async def handler(request):
         tokens = array("i")
@@ -202,6 +202,7 @@ def remote(stubbed, monkeypatch):
                 request.headers.get(server.REQUEST_TOKENS_HEADER),
             )
         )
+        seen.request_ids.add(request.headers.get(server.REQUEST_ID_HEADER))
         ordinal = len(seen)
         seen.in_flight += 1
         seen.peak = max(seen.peak, seen.in_flight)
@@ -235,13 +236,15 @@ def test_redact_fans_windows_out_through_the_gateway(stubbed, remote):
             return await c.post(
                 "/redact",
                 json={"text": text_of(n)},
-                headers={server.KEY_HASH_HEADER: "caller-hash"},
+                headers={server.KEY_HASH_HEADER: "caller-hash", server.REQUEST_ID_HEADER: "req-1"},
             )
 
     response = run(go())
     assert response.status_code == 200
     assert len(remote) == len(plans)
-    assert remote.peak == server.FORWARD_FANOUT  # bounded, but saturated
+    # every window is posted at once: the gateway queue does the scheduling
+    assert remote.peak == len(plans)
+    assert remote.request_ids == {"req-1"}
     assert {key for key, _, _ in remote} == {"caller-hash"}
     assert {req_tokens for _, _, req_tokens in remote} == {str(n)}
     assert sorted(tokens[0] for _, tokens, _ in remote) == [p.start for p in plans]

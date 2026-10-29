@@ -8,12 +8,16 @@ HuggingFace download or egress required.
 Each process plays two roles:
 
 - coordinator: /redact tokenizes the input, cuts it into overlapping
-  windows (chunking.py) and runs the windows concurrently — through the
-  gateway's /forward when OPF_FORWARD_URL is set, so every worker's forward
-  lane can take part, or in-process otherwise — then stitches the per-token
-  scores together and runs the unchanged global decode.
-- forward lane: /forward runs one model forward over one window, guarded
-  by the OPF_MAX_CONCURRENCY semaphore. This is the only CPU-heavy path.
+  windows (chunking.py) and posts every window at once — to the gateway's
+  /forward when OPF_FORWARD_URL is set, whose queue schedules them fairly
+  across callers and every worker's lane, or in-process otherwise — then
+  stitches the per-token scores together and runs the unchanged global
+  decode. When the gateway ends the request (answered, timed out, client
+  gone) it refuses the request's remaining windows and the coordinator
+  stops.
+- forward lane: /forward runs one model forward over one window at a time
+  (one interpreter, one torch pool, one rotary offset). This is the only
+  CPU-heavy path.
 """
 
 import asyncio
@@ -57,16 +61,10 @@ WINDOW_OVERLAP = int(os.environ.get("OPF_WINDOW_OVERLAP", "1024"))
 FORWARD_URL = os.environ.get("OPF_FORWARD_URL") or None
 # A window may wait in the gateway queue for up to the request ceiling.
 FORWARD_TIMEOUT_SECONDS = float(os.environ.get("OPF_MAX_REQUEST_SECONDS", "900"))
-# How many windows one request keeps in flight to the gateway at once. The
-# gateway queue does the real scheduling; this just keeps a 250-window
-# request from opening 250 sockets. Default: twice the forward lanes.
-FORWARD_FANOUT = int(
-    os.environ.get("OPF_FORWARD_FANOUT")
-    or 2
-    * int(os.environ.get("OPF_WORKERS", "1"))
-    * int(os.environ.get("OPF_MAX_CONCURRENCY", "1"))
-)
 KEY_HASH_HEADER = "X-Tinfoil-Key-Hash"
+# The gateway's id for the /redact this coordinator is serving; echoed on
+# every /forward so the gateway can drop the request's queue when it ends.
+REQUEST_ID_HEADER = "X-Tinfoil-Request-ID"
 # Input token count returned to the gateway on every /redact response; the
 # gateway meters it on the usage event and strips it from the client response.
 INPUT_TOKENS_HEADER = "X-Tinfoil-Input-Tokens"
@@ -187,8 +185,10 @@ def load_model():
         raise ValueError(f"Unsupported OPF_COMPUTE_DTYPE: {compute_dtype!r}")
     _encoding = _runtime.encoding
     _init_rotary_offsets(_runtime.model)
-    max_concurrency = int(os.environ.get("OPF_MAX_CONCURRENCY", "1"))
-    _semaphore = asyncio.Semaphore(max_concurrency)
+    for retired in ("OPF_MAX_CONCURRENCY", "OPF_FORWARD_FANOUT"):
+        if os.environ.get(retired):
+            raise ValueError(f"{retired} is no longer a setting: one forward at a time per worker")
+    _semaphore = asyncio.Semaphore(1)
     if FORWARD_URL is not None:
         _forward_client = httpx.AsyncClient(
             timeout=FORWARD_TIMEOUT_SECONDS,
@@ -196,13 +196,11 @@ def load_model():
         )
     MODEL_LOADED.set(1)
     log.info(
-        "Model loaded on %s (max_concurrency=%d, window=%d, overlap=%d, forward=%s, fanout=%d)",
+        "Model loaded on %s (window=%d, overlap=%d, forward=%s)",
         DEVICE,
-        max_concurrency,
         WINDOW_TOKENS,
         WINDOW_OVERLAP,
         FORWARD_URL or "in-process",
-        FORWARD_FANOUT,
     )
 
 
@@ -333,8 +331,8 @@ def scores_view(payload: bytes, rows: int, classes: int) -> memoryview:
 async def run_window(
     tokens: list[int],
     key_hash: str,
+    request_id: str,
     request_tokens: int,
-    fanout: asyncio.Semaphore,
     position_offset: int = 0,
 ) -> memoryview:
     """Score one window: on this process, or via the gateway's fair queue."""
@@ -353,17 +351,17 @@ async def run_window(
         last_error = None
         for attempt in range(2):
             try:
-                async with fanout:
-                    response = await _forward_client.post(
-                        FORWARD_URL,
-                        content=array("i", tokens).tobytes(),
-                        headers={
-                            "Content-Type": OCTET_STREAM,
-                            KEY_HASH_HEADER: key_hash,
-                            REQUEST_TOKENS_HEADER: str(request_tokens),
-                            POSITION_OFFSET_HEADER: str(position_offset),
-                        },
-                    )
+                response = await _forward_client.post(
+                    FORWARD_URL,
+                    content=array("i", tokens).tobytes(),
+                    headers={
+                        "Content-Type": OCTET_STREAM,
+                        KEY_HASH_HEADER: key_hash,
+                        REQUEST_ID_HEADER: request_id,
+                        REQUEST_TOKENS_HEADER: str(request_tokens),
+                        POSITION_OFFSET_HEADER: str(position_offset),
+                    },
+                )
             except httpx.HTTPError as exc:
                 FORWARD_FAILURES.labels(status="transport").inc()
                 last_error = f"forward dispatch failed: {type(exc).__name__}: {exc}"
@@ -474,18 +472,20 @@ async def redact(req: RedactRequest, request: Request, response: Response):
         plans = plan_windows(len(tokens), WINDOW_TOKENS, WINDOW_OVERLAP)
         WINDOWS_TOTAL.inc(len(plans))
         key_hash = request.headers.get(KEY_HASH_HEADER, "")
-        fanout = asyncio.Semaphore(FORWARD_FANOUT)
+        request_id = request.headers.get(REQUEST_ID_HEADER, "")
         try:
-            # A TaskGroup cancels the remaining windows when one fails, so a
-            # refused window does not leave the rest burning worker time.
+            # Every window goes to the gateway queue at once; it schedules
+            # them. A TaskGroup cancels the remaining windows when one fails
+            # (including the gateway refusing them because the request
+            # ended), so nothing of a dead request keeps running here.
             async with asyncio.TaskGroup() as group:
                 tasks = [
                     group.create_task(
                         run_window(
                             tokens[plan.start : plan.end],
                             key_hash,
+                            request_id,
                             len(tokens),
-                            fanout,
                             position_offset=plan.start,
                         )
                     )

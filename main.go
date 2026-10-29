@@ -73,7 +73,8 @@ func intEnv(name string, fallback, minimum int) (int, error) {
 }
 
 // forwardLimitsFromEnv sizes the forward scheduler and request deadlines:
-// workers × the per-worker OPF_MAX_CONCURRENCY lanes may run at once,
+// one lane per worker may run at once (a worker process runs one forward
+// at a time: one interpreter, one torch pool, one rotary offset),
 // OPF_MAX_QUEUED_WINDOWS windows may wait for one, and a request is allowed
 // OPF_WINDOW_TIMEOUT_SECONDS per window (estimated with OPF_WINDOW_TOKENS /
 // OPF_WINDOW_OVERLAP, the geometry the workers use) up to
@@ -84,13 +85,17 @@ func intEnv(name string, fallback, minimum int) (int, error) {
 // model seeded by OPF_MS_PER_TOKEN.
 func forwardLimitsFromEnv(workers int) (forwardLimits, error) {
 	var limits forwardLimits
-	var concurrency, windowTimeout, maxRequest, forwardTimeout int
+	var windowTimeout, maxRequest, forwardTimeout int
+	for _, retired := range []string{"OPF_MAX_CONCURRENCY", "OPF_FORWARD_FANOUT"} {
+		if os.Getenv(retired) != "" {
+			return forwardLimits{}, fmt.Errorf("%s is no longer a setting: each worker runs one forward at a time and posts every window of a request to the gateway queue", retired)
+		}
+	}
 	for _, v := range []struct {
 		name              string
 		fallback, minimum int
 		into              *int
 	}{
-		{"OPF_MAX_CONCURRENCY", defaultMaxConcurrency, 1, &concurrency},
 		{"OPF_MAX_QUEUED_WINDOWS", defaultMaxQueuedWindows, 1, &limits.maxQueued},
 		{"OPF_WINDOW_TOKENS", defaultWindowTokens, 1, &limits.windowTokens},
 		{"OPF_WINDOW_OVERLAP", defaultWindowOverlap, 0, &limits.windowOverlap},
@@ -112,7 +117,7 @@ func forwardLimitsFromEnv(workers int) (forwardLimits, error) {
 		return forwardLimits{}, err
 	}
 	limits.shortTokens = shortTokens
-	limits.maxInflight = workers * concurrency
+	limits.maxInflight = workers
 	limits.windowTimeout = time.Duration(windowTimeout) * time.Second
 	limits.maxRequest = time.Duration(maxRequest) * time.Second
 	limits.forwardTimeout = time.Duration(forwardTimeout) * time.Second

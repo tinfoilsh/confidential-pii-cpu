@@ -24,7 +24,6 @@ containers:
       - OPF_CHECKPOINT: "/tinfoil/models/privacy-filter/original"
       - OPF_DEVICE: "cpu"
       - OPF_NUM_THREADS: "8"
-      - OPF_MAX_CONCURRENCY: "1"
       - OPF_WORKERS: "4"
       # Long inputs run as 6144-token windows overlapping by 1024 (the
       # model's receptive field), so chunked output equals one long pass.

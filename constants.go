@@ -34,6 +34,10 @@ const (
 	// requestTokensHeader carries the owning request's total token count on
 	// each /forward so the scheduler can tell short requests from long ones.
 	requestTokensHeader = "X-Tinfoil-Request-Tokens"
+	// The /redact request a window belongs to: minted by the gateway, handed
+	// to the coordinator, echoed on every /forward, used to cancel the
+	// request's queued windows when the /redact ends.
+	requestIDHeader = "X-Tinfoil-Request-ID"
 	// positionOffsetHeader carries a window's absolute token offset on each
 	// /forward, relayed to the worker so the window runs at its true
 	// positions (bit-for-bit the same rotary angles as an unchunked pass).
@@ -45,7 +49,6 @@ const (
 	// rateSampleMinTokens: only forwards at least this long update the
 	// ms-per-token estimate behind lane ETAs (see forwardScheduler.release).
 	rateSampleMinTokens     = 1024
-	defaultMaxConcurrency   = 1
 	defaultMaxQueuedWindows = 4096
 	headerTimeout           = 10 * time.Second
 	// A /redact request may run for requestBaseTimeout plus
