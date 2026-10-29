@@ -185,6 +185,9 @@ def remote(stubbed, monkeypatch):
     """Route windows through a fake gateway /queue that records each call."""
     class Seen(list):
         fail_window = None
+        # ordinal -> a reply to send instead of a good one, consumed once:
+        # an httpx.Response, or an exception to raise (a transport error).
+        faults = {}
         in_flight = 0
         peak = 0
 
@@ -210,7 +213,15 @@ def remote(stubbed, monkeypatch):
         seen.in_flight -= 1
         if ordinal == seen.fail_window:
             return httpx.Response(503, text="privacy filter is at capacity")
-        payload, classes = fake_forward(tokens)
+        if ordinal in seen.faults:
+            fault = seen.faults.pop(ordinal)
+            if isinstance(fault, Exception):
+                raise fault
+            return fault
+        # The gateway relays the window's absolute position to the worker;
+        # the fake runs the window there, as the real one does.
+        offset = int(request.headers.get(server.POSITION_OFFSET_HEADER, "0"))
+        payload, classes = fake_forward(tokens, offset)
         return httpx.Response(
             200,
             content=payload,
@@ -249,7 +260,62 @@ def test_redact_fans_windows_out_through_the_gateway(stubbed, remote):
     assert {req_tokens for _, _, req_tokens in remote} == {str(n)}
     assert sorted(tokens[0] for _, tokens, _ in remote) == [p.start for p in plans]
     (_, tokens, rows), = stubbed.calls
-    assert [r[0] for r in rows] == [float(t) for t in tokens]
+    # Each window was posted with its absolute offset and the stitched rows
+    # carry the true positions: exactly one pass over the whole sequence.
+    assert rows == fake_rows(tokens)
+
+
+def _chunk(n, **kw):
+    async def go():
+        async with client() as c:
+            return await c.post("/chunk", json={"text": text_of(n)}, **kw)
+
+    return run(go())
+
+
+def test_window_is_retried_once_after_a_transport_error_or_malformed_reply(stubbed, remote):
+    n = 5000
+    plans = plan_windows(n, 1024, 128)
+    assert len(plans) >= 3
+    remote.faults = {
+        1: httpx.ConnectError("worker connection reset"),
+        2: httpx.Response(200, content=b"\x00" * 8, headers={server.SHAPE_HEADER: "1024,2"}),  # short body
+        3: httpx.Response(200, content=b"\x00" * 8),  # no shape header
+    }
+    response = _chunk(n)
+    assert response.status_code == 200
+    assert len(remote) == len(plans) + 3  # three windows went twice
+    assert not remote.faults
+    (_, tokens, rows), = stubbed.calls
+    assert rows == fake_rows(tokens)
+
+
+def test_wedged_worker_window_is_requeued_once(stubbed, remote):
+    n = 5000
+    plans = plan_windows(n, 1024, 128)
+    remote.faults = {2: httpx.Response(504, text="privacy filter forward timed out")}
+    response = _chunk(n)
+    assert response.status_code == 200
+    assert len(remote) == len(plans) + 1
+    (_, tokens, rows), = stubbed.calls
+    assert rows == fake_rows(tokens)
+
+
+def test_window_that_fails_twice_fails_the_request(stubbed, remote):
+    # Every post fails (ordinals count posts, and with all windows posted at
+    # once a retry's ordinal is not fixed): the first window to fail twice
+    # gives up and the request is a 502, nothing partial.
+    remote.faults = {k: httpx.ConnectError("reset") for k in range(1, 40)}
+    response = _chunk(5000)
+    assert response.status_code == 502
+    assert stubbed.calls == []
+
+
+def test_window_refused_as_no_longer_active_fails_fast(stubbed, remote):
+    remote.faults = {1: httpx.Response(409, text="request no longer active")}
+    response = _chunk(5000)
+    assert response.status_code == 409
+    assert stubbed.calls == []
 
 
 def test_redact_reports_capacity_when_the_gateway_refuses_a_window(stubbed, remote):

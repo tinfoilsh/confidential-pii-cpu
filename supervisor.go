@@ -87,6 +87,7 @@ func (s *workerSupervisor) url(i int) string { return "http://" + inferenceHost 
 // the caller tears down.
 func (s *workerSupervisor) startAll() error {
 	for i := range s.workers {
+		s.workers[i].ready.Store(false)
 		if err := s.spawn(i); err != nil {
 			return fmt.Errorf("start inference worker %d: %w", i, err)
 		}
@@ -123,6 +124,9 @@ func (s *workerSupervisor) spawn(i int) error {
 		// loading the model takes longer than healthFailureThreshold probes
 		// and a worker killed mid-load would only load again.
 		proc.bootErr = s.awaitReady(watchCtx, i)
+		if proc.bootErr == nil {
+			s.workers[i].ready.Store(true)
+		}
 		close(proc.ready)
 		if proc.bootErr != nil {
 			return // replace (or shutdown) handles it
@@ -169,6 +173,7 @@ func (s *workerSupervisor) replace(i int, reason error) {
 	s.mu.Unlock()
 
 	s.workers[i].wedged.Store(true)
+	s.workers[i].ready.Store(false)
 	if tooMany {
 		s.fail(fmt.Errorf("inference worker %d replaced %d times within %s (last: %v); giving up", i, len(s.restarts[i]), workerRestartWindow, reason))
 		return
@@ -250,9 +255,15 @@ func (s *workerSupervisor) stop() {
 	s.stopping = true
 	procs := append([]*workerProc(nil), s.procs...)
 	s.mu.Unlock()
-	for _, proc := range procs {
-		if proc != nil {
-			<-proc.exited
+	for i, proc := range procs {
+		if proc == nil {
+			continue
 		}
+		if s.workers[i].wedged.Load() {
+			// A wedged worker never handles SIGTERM (the interpreter is
+			// stuck); do not wait WaitDelay for it.
+			_ = proc.cmd.Process.Kill()
+		}
+		<-proc.exited
 	}
 }

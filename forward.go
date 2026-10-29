@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -43,6 +42,12 @@ type forwardLimits struct {
 	// armed > 0 applies the hold rule only while a short request has been
 	// seen within this long, so an idle night runs flat out.
 	armed time.Duration
+	// longGrace is the floor under the long class: short windows go first,
+	// but if no long window has been dispatched for longGrace while some
+	// wait, the next lane goes to one (the hold rule still applies). Short
+	// calls arriving faster than the lanes clear them would otherwise starve
+	// documents until their deadline. 0 disables the floor.
+	longGrace time.Duration
 	// msPerToken seeds the EWMA used to predict when busy lanes free.
 	msPerToken float64
 }
@@ -154,9 +159,11 @@ func (q *callerQueue) dropKey(key string) {
 var shortWaitBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10}
 
 // forwardScheduler hands windows to lanes. Short requests' windows are
-// served before long ones; within each class callers (the hash the /redact
-// proxy stamps on its request) are served round-robin, FIFO per caller, and
-// each window goes to the worker with the fewest forwards in flight. A
+// served before long ones, except that a long window is dispatched at least
+// every longGrace (see forwardLimits); within each class callers (the hash
+// the /redact proxy stamps on its request) are served round-robin, FIFO per
+// caller, and each window goes to the worker with the fewest forwards in
+// flight. A
 // coordinator posts every window of a request at once; when the request
 // ends (answered, timed out, or the client gone) the gateway cancels its
 // queued windows here. The hold rule (see forwardLimits) keeps a lane
@@ -174,6 +181,7 @@ type forwardScheduler struct {
 
 	msPerToken float64
 	lastShort  time.Time
+	lastLong   time.Time // last dispatch of a long window: the floor's clock
 	// holdSince/holdLanes account lane-seconds left idle by the hold rule.
 	holdSince   time.Time
 	holdLanes   int
@@ -202,6 +210,7 @@ func newForwardScheduler(workers []*worker, limits forwardLimits) *forwardSchedu
 		msPerToken: limits.msPerToken,
 		now:        time.Now,
 	}
+	s.lastLong = s.now()
 	for i := range limits.maxInflight {
 		s.lanes = append(s.lanes, &lane{worker: workers[i%len(workers)]})
 	}
@@ -344,28 +353,35 @@ func (s *forwardScheduler) dispatchLocked() {
 		s.holdTimer = nil
 	}
 	for s.inflight < len(s.lanes) && s.queued > 0 {
-		item, pop := s.nextLocked()
 		l := s.freeLaneLocked()
 		if l == nil {
 			return // every free lane belongs to a worker being replaced
 		}
-		if !item.short && s.holdActiveLocked() {
-			if wait := s.holdDelayLocked(l); wait > 0 {
-				s.holdSince = s.now()
-				s.holdLanes = len(s.lanes) - s.inflight
-				s.holdTimer = time.AfterFunc(wait, func() {
-					s.mu.Lock()
-					defer s.mu.Unlock()
-					s.dispatchLocked()
-				})
-				return
-			}
+		var wait time.Duration
+		if s.long.size > 0 && s.holdActiveLocked() {
+			wait = s.holdDelayLocked(l)
+		}
+		item, pop := s.nextLocked(wait > 0)
+		if item == nil {
+			// Only long windows wait and the hold rule keeps this lane for a
+			// short call: re-evaluate when the predictions come within range
+			// (a release re-evaluates sooner).
+			s.holdSince = s.now()
+			s.holdLanes = len(s.lanes) - s.inflight
+			s.holdTimer = time.AfterFunc(wait, func() {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				s.dispatchLocked()
+			})
+			return
 		}
 		pop()
 		s.queued--
 		s.inflight++
 		if item.short {
 			s.observeShortWaitLocked(s.now().Sub(item.enqueuedAt).Seconds())
+		} else {
+			s.lastLong = s.now()
 		}
 		l.busy, l.start, l.tokens = true, s.now(), item.tokens
 		l.worker.forwards++
@@ -374,12 +390,19 @@ func (s *forwardScheduler) dispatchLocked() {
 }
 
 // nextLocked peeks the window to dispatch next and returns the function that
-// removes it from its queue.
-func (s *forwardScheduler) nextLocked() (*forwardItem, func()) {
+// removes it from its queue; nil when nothing may be dispatched now (only
+// long windows wait and held is set). Short windows go first, except that
+// the floor sends a long window when none has gone for longGrace.
+func (s *forwardScheduler) nextLocked(held bool) (*forwardItem, func()) {
+	longEligible := s.long.size > 0 && !held
+	floorDue := s.limits.longGrace > 0 && s.now().Sub(s.lastLong) >= s.limits.longGrace
+	if longEligible && (s.short.size == 0 || floorDue) {
+		return s.long.peek()
+	}
 	if s.short.size > 0 {
 		return s.short.peek()
 	}
-	return s.long.peek()
+	return nil, nil
 }
 
 func (s *forwardScheduler) holdActiveLocked() bool {
@@ -484,11 +507,3 @@ func keyHash(credential string) string {
 
 // isLoopback reports whether a request came from this host. /forward is an
 // internal fan-out path; only the coordinating workers may use it.
-func isLoopback(remoteAddr string) bool {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		host = remoteAddr
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}

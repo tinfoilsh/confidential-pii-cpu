@@ -128,6 +128,9 @@ func forwardLimitsFromEnv(workers int) (forwardLimits, error) {
 		return forwardLimits{}, err
 	}
 	limits.armed = armed
+	if limits.longGrace, err = secondsEnv("OPF_LONG_GRACE_SECONDS", defaultLongGrace); err != nil {
+		return forwardLimits{}, err
+	}
 	if limits.msPerToken, err = floatEnv("OPF_MS_PER_TOKEN", defaultMsPerToken); err != nil {
 		return forwardLimits{}, err
 	}
@@ -154,7 +157,7 @@ func queueURLForWorkers() string {
 	if raw := strings.TrimSpace(os.Getenv("OPF_QUEUE_URL")); raw != "" {
 		return raw
 	}
-	return "http://" + inferenceHost + listenAddress + queuePath
+	return "http://" + queueAddress + queuePath
 }
 
 func secondsEnv(name string, fallback time.Duration) (time.Duration, error) {
@@ -237,8 +240,10 @@ func run(ctx context.Context) error {
 	}
 
 	server := &http.Server{Addr: listenAddress, Handler: front, ReadHeaderTimeout: headerTimeout, ReadTimeout: limits.maxRequest, IdleTimeout: limits.maxRequest}
-	serverDone := make(chan error, 1)
+	queueServer := &http.Server{Addr: queueAddress, Handler: front.internal, ReadHeaderTimeout: headerTimeout, ReadTimeout: limits.maxRequest, IdleTimeout: limits.maxRequest}
+	serverDone := make(chan error, 2)
 	go func() { serverDone <- server.ListenAndServe() }()
+	go func() { serverDone <- queueServer.ListenAndServe() }()
 
 	var result error
 	select {
@@ -256,6 +261,7 @@ func run(ctx context.Context) error {
 		_ = server.Close()
 		result = errors.Join(result, err)
 	}
+	_ = queueServer.Close() // the workers' window posts; nothing to drain
 	stopBackend()
 	supervisor.stop()
 	return result

@@ -365,11 +365,13 @@ func TestGatewayCancelsQueuedWindowsWhenRedactEnds(t *testing.T) {
 	}))
 	defer coordinator.Close()
 	target, _ := url.Parse(coordinator.URL)
-	gateway := httptest.NewServer(newGateway([]*url.URL{target}, &recordedUsage{}, limitsWith(1, 64)))
+	front := newGateway([]*url.URL{target}, &recordedUsage{}, limitsWith(1, 64))
+	gateway := httptest.NewServer(front)
 	defer gateway.Close()
+	queue := serveQueue(t, front)
 
 	// Occupy the lane.
-	go forwardWindow(t, gateway.URL, "someone", 1, 1_000_000)
+	go forwardWindow(t, queue, "someone", 1, 1_000_000)
 	waitFor(t, func() bool { return lane.busy.Load() == 1 })
 
 	// Client starts a /redact, then disconnects.
@@ -387,7 +389,7 @@ func TestGatewayCancelsQueuedWindowsWhenRedactEnds(t *testing.T) {
 	type result struct{ status int }
 	results := make(chan result, 3)
 	post := func(id string) {
-		req, _ := http.NewRequest(http.MethodPost, gateway.URL+queuePath, bytes.NewReader(make([]byte, 4)))
+		req, _ := http.NewRequest(http.MethodPost, queue+queuePath, bytes.NewReader(make([]byte, 4)))
 		req.Header.Set("Content-Type", "application/octet-stream")
 		req.Header.Set(keyHashHeader, "caller")
 		req.Header.Set(requestIDHeader, id)

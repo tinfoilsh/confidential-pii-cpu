@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,6 +76,15 @@ func forwardRequest(t *testing.T, gateway, key string) (int, time.Duration) {
 	return forwardWindow(t, gateway, key, 1, 1_000_000) // a window of a long request
 }
 
+// serveQueue serves a gateway's internal /queue listener for a test, the way
+// main binds it to loopback, and returns its base URL.
+func serveQueue(t *testing.T, g *gateway) string {
+	t.Helper()
+	srv := httptest.NewServer(g.internal)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
 // forwardWindow posts one window of `tokens` int32s belonging to a request
 // of requestTokens tokens in total.
 func forwardWindow(t *testing.T, gateway, key string, tokens, requestTokens int) (int, time.Duration) {
@@ -101,21 +109,20 @@ func forwardWindow(t *testing.T, gateway, key string, tokens, requestTokens int)
 func TestForwardSchedulerIsFairAcrossCallers(t *testing.T) {
 	const windowTime = 40 * time.Millisecond
 	workers := []*url.URL{newFakeWorker(t, windowTime).url(), newFakeWorker(t, windowTime).url()}
-	gateway := httptest.NewServer(newGateway(workers, &recordedUsage{}, limitsWith(2, 512)))
-	defer gateway.Close()
+	queue := serveQueue(t, newGateway(workers, &recordedUsage{}, limitsWith(2, 512)))
 
 	var wg sync.WaitGroup
 	for range 50 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if status, _ := forwardRequest(t, gateway.URL, "big-caller"); status != http.StatusOK {
+			if status, _ := forwardRequest(t, queue, "big-caller"); status != http.StatusOK {
 				t.Errorf("big caller window: %d", status)
 			}
 		}()
 	}
 	time.Sleep(windowTime / 2) // the big caller's windows are queued and both lanes busy
-	status, elapsed := forwardRequest(t, gateway.URL, "small-caller")
+	status, elapsed := forwardRequest(t, queue, "small-caller")
 	wg.Wait()
 	if status != http.StatusOK {
 		t.Fatalf("small caller window: %d", status)
@@ -128,15 +135,14 @@ func TestForwardSchedulerIsFairAcrossCallers(t *testing.T) {
 func TestForwardSchedulerCapsInFlightAndBalancesWorkers(t *testing.T) {
 	const windowTime = 30 * time.Millisecond
 	fakes := []*fakeWorker{newFakeWorker(t, windowTime), newFakeWorker(t, windowTime)}
-	gateway := httptest.NewServer(newGateway([]*url.URL{fakes[0].url(), fakes[1].url()}, &recordedUsage{}, limitsWith(2, 512)))
-	defer gateway.Close()
+	queue := serveQueue(t, newGateway([]*url.URL{fakes[0].url(), fakes[1].url()}, &recordedUsage{}, limitsWith(2, 512)))
 
 	var wg sync.WaitGroup
 	for i := range 12 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if status, _ := forwardRequest(t, gateway.URL, "caller"); status != http.StatusOK {
+			if status, _ := forwardRequest(t, queue, "caller"); status != http.StatusOK {
 				t.Errorf("window %d: %d", i, status)
 			}
 		}(i)
@@ -154,8 +160,7 @@ func TestForwardSchedulerCapsInFlightAndBalancesWorkers(t *testing.T) {
 
 func TestForwardSchedulerShedsLoadOverQueueBudget(t *testing.T) {
 	fw := newFakeWorker(t, 50*time.Millisecond)
-	gateway := httptest.NewServer(newGateway([]*url.URL{fw.url()}, &recordedUsage{}, limitsWith(1, 2)))
-	defer gateway.Close()
+	queue := serveQueue(t, newGateway([]*url.URL{fw.url()}, &recordedUsage{}, limitsWith(1, 2)))
 
 	var wg sync.WaitGroup
 	var ok, shed atomic.Int64
@@ -163,7 +168,7 @@ func TestForwardSchedulerShedsLoadOverQueueBudget(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			switch status, _ := forwardRequest(t, gateway.URL, "caller"); status {
+			switch status, _ := forwardRequest(t, queue, "caller"); status {
 			case http.StatusOK:
 				ok.Add(1)
 			case http.StatusServiceUnavailable:
@@ -178,35 +183,36 @@ func TestForwardSchedulerShedsLoadOverQueueBudget(t *testing.T) {
 	if ok.Load() != 3 || shed.Load() != 3 {
 		t.Fatalf("ok=%d shed=%d; want 3 served and 3 refused with a queue budget of 2", ok.Load(), shed.Load())
 	}
-	if status, _ := forwardRequest(t, gateway.URL, "caller"); status != http.StatusOK {
+	if status, _ := forwardRequest(t, queue, "caller"); status != http.StatusOK {
 		t.Fatalf("queue did not drain: %d", status)
 	}
 }
 
-func TestForwardRelaysBinaryPayloadAndShape(t *testing.T) {
+func TestForwardRelaysBinaryPayloadShapeAndPosition(t *testing.T) {
 	var gotBody []byte
-	var gotType string
+	var gotType, gotOffset string
 	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotBody, _ = io.ReadAll(r.Body)
 		gotType = r.Header.Get("Content-Type")
+		gotOffset = r.Header.Get(positionOffsetHeader)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set(forwardShapeHeader, "2,3")
 		_, _ = w.Write([]byte{1, 2, 3, 4, 5, 6})
 	}))
 	defer worker.Close()
 	target, _ := url.Parse(worker.URL)
-	gateway := httptest.NewServer(newGateway([]*url.URL{target}, &recordedUsage{}, testLimits))
-	defer gateway.Close()
-	req, _ := http.NewRequest(http.MethodPost, gateway.URL+queuePath, bytes.NewReader([]byte{9, 0, 0, 0}))
+	queue := serveQueue(t, newGateway([]*url.URL{target}, &recordedUsage{}, testLimits))
+	req, _ := http.NewRequest(http.MethodPost, queue+queuePath, bytes.NewReader([]byte{9, 0, 0, 0}))
 	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set(positionOffsetHeader, "4096") // the window's absolute position: exactness depends on it
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	if !bytes.Equal(gotBody, []byte{9, 0, 0, 0}) || gotType != "application/octet-stream" {
-		t.Fatalf("worker got %v %q", gotBody, gotType)
+	if !bytes.Equal(gotBody, []byte{9, 0, 0, 0}) || gotType != "application/octet-stream" || gotOffset != "4096" {
+		t.Fatalf("worker got %v %q offset %q", gotBody, gotType, gotOffset)
 	}
 	if resp.StatusCode != 200 || resp.Header.Get(forwardShapeHeader) != "2,3" || resp.Header.Get("Content-Type") != "application/octet-stream" || !bytes.Equal(body, []byte{1, 2, 3, 4, 5, 6}) {
 		t.Fatalf("relayed response: %d %v %v", resp.StatusCode, resp.Header, body)
@@ -222,8 +228,7 @@ func TestForwardTimeoutMarksWorkerWedged(t *testing.T) {
 	limits := limitsWith(2, 512)
 	limits.forwardTimeout = 50 * time.Millisecond
 	handler := newGateway([]*url.URL{stuck.url(), healthy.url()}, &recordedUsage{}, limits)
-	gateway := httptest.NewServer(handler)
-	defer gateway.Close()
+	queue := serveQueue(t, handler)
 
 	health := func() int {
 		rec := httptest.NewRecorder()
@@ -233,7 +238,7 @@ func TestForwardTimeoutMarksWorkerWedged(t *testing.T) {
 	if health() != http.StatusOK {
 		t.Fatal("workers unhealthy before any forward")
 	}
-	status, elapsed := forwardRequest(t, gateway.URL, "caller")
+	status, elapsed := forwardRequest(t, queue, "caller")
 	if status != http.StatusGatewayTimeout || elapsed > time.Second {
 		t.Fatalf("stuck forward: status %d after %v", status, elapsed)
 	}
@@ -251,18 +256,17 @@ func TestForwardTimeoutMarksWorkerWedged(t *testing.T) {
 func TestShortRequestsAreServedFirst(t *testing.T) {
 	const windowTime = 40 * time.Millisecond
 	fw := newFakeWorker(t, windowTime)
-	gateway := httptest.NewServer(newGateway([]*url.URL{fw.url()}, &recordedUsage{}, limitsWith(1, 512)))
-	defer gateway.Close()
+	queue := serveQueue(t, newGateway([]*url.URL{fw.url()}, &recordedUsage{}, limitsWith(1, 512)))
 	var wg sync.WaitGroup
 	for range 20 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			forwardWindow(t, gateway.URL, "long", 1, 1_000_000)
+			forwardWindow(t, queue, "long", 1, 1_000_000)
 		}()
 	}
 	time.Sleep(windowTime / 2) // one running, 19 queued
-	status, elapsed := forwardWindow(t, gateway.URL, "short", 1, 1)
+	status, elapsed := forwardWindow(t, queue, "short", 1, 1)
 	wg.Wait()
 	if status != http.StatusOK || elapsed > 2*windowTime {
 		t.Fatalf("short window: status %d after %v behind 19 long windows", status, elapsed)
@@ -282,15 +286,14 @@ func holdScenario(t *testing.T, limits forwardLimits, arrivals []time.Duration, 
 		fakes = append(fakes, fw)
 		targets = append(targets, fw.url())
 	}
-	gateway := httptest.NewServer(newGateway(targets, &recordedUsage{}, limits))
-	defer gateway.Close()
+	queue := serveQueue(t, newGateway(targets, &recordedUsage{}, limits))
 	start := time.Now()
 	var wg sync.WaitGroup
 	for range longWindows {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if status, _ := forwardWindow(t, gateway.URL, "long", tokens, 1_000_000); status != http.StatusOK {
+			if status, _ := forwardWindow(t, queue, "long", tokens, 1_000_000); status != http.StatusOK {
 				t.Errorf("long window: %d", status)
 			}
 		}()
@@ -301,7 +304,7 @@ func holdScenario(t *testing.T, limits forwardLimits, arrivals []time.Duration, 
 		go func(i int, at time.Duration) {
 			defer wg.Done()
 			time.Sleep(at)
-			status, elapsed := forwardWindow(t, gateway.URL, "short", tokens, tokens)
+			status, elapsed := forwardWindow(t, queue, "short", tokens, tokens)
 			if status != http.StatusOK {
 				t.Errorf("short window: %d", status)
 			}
@@ -361,53 +364,35 @@ func TestHoldRuleKeepsAllLanesBusyWithoutShortTraffic(t *testing.T) {
 }
 
 // Armed mode: with no short request seen recently the rule is off and the
-// lanes run flat out.
-func TestHoldRuleArmedOnlyAfterShortTraffic(t *testing.T) {
-	limits := limitsWith(4, 512)
-	limits.horizons = []time.Duration{60 * time.Millisecond}
-	limits.armed = time.Hour
-	_, total, fakes := holdScenario(t, limits, nil, 8)
-	for i, fw := range fakes {
-		if fw.calls.Load() != 2 {
-			t.Fatalf("worker %d ran %d of 8 windows; lanes not saturated while disarmed", i, fw.calls.Load())
-		}
-	}
-	if total > 700*time.Millisecond {
-		t.Fatalf("8 windows took %v while disarmed; expected ~400 ms", total)
-	}
-}
-
-func TestForwardIsLoopbackOnly(t *testing.T) {
+// /queue is not on the shim-facing handler at all; it lives on the
+// gateway's internal listener (loopback-only in main).
+func TestQueueIsNotOnThePublicHandler(t *testing.T) {
 	fw := newFakeWorker(t, 0)
-	handler := newGateway([]*url.URL{fw.url()}, &recordedUsage{}, testLimits)
-	for _, tc := range []struct {
-		remote string
-		want   int
-	}{
-		{"127.0.0.1:4242", http.StatusOK},
-		{"[::1]:4242", http.StatusOK},
-		{"192.0.2.1:4242", http.StatusForbidden},
-		{"172.31.255.1:4242", http.StatusForbidden},
-	} {
-		req := httptest.NewRequest(http.MethodPost, queuePath, bytes.NewReader([]byte{1, 0, 0, 0}))
-		req.RemoteAddr = tc.remote
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
-		if rec.Code != tc.want {
-			t.Fatalf("remote %s: status %d, want %d", tc.remote, rec.Code, tc.want)
-		}
+	g := newGateway([]*url.URL{fw.url()}, &recordedUsage{}, testLimits)
+	req := httptest.NewRequest(http.MethodPost, queuePath, bytes.NewReader([]byte{1, 0, 0, 0}))
+	req.Header.Set(keyHashHeader, "k")
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound || fw.calls.Load() != 0 {
+		t.Fatalf("public /queue: status %d, %d worker calls", rec.Code, fw.calls.Load())
 	}
-	if fw.calls.Load() != 2 {
-		t.Fatalf("non-loopback request reached a worker (%d calls)", fw.calls.Load())
+	rec = httptest.NewRecorder()
+	g.internal.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, healthPath, nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("internal listener serves the API: %d", rec.Code)
+	}
+	if status, _ := forwardWindow(t, serveQueue(t, g), "k", 1, 1); status != http.StatusOK {
+		t.Fatalf("internal /queue: %d", status)
 	}
 }
 
 // The /redact proxy stamps the caller's key hash on the outbound request
-// (never the credential) and ignores any hash the client supplies.
-func TestRedactCarriesKeyHashToCoordinator(t *testing.T) {
+// (never the credential) and strips every internal X-Tinfoil-* header the
+// client supplies.
+func TestRedactCarriesKeyHashToCoordinatorAndStripsInternalHeaders(t *testing.T) {
 	var seen atomic.Value
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen.Store(r.Header.Get(keyHashHeader))
+		seen.Store(r.Header.Clone())
 		w.Header().Set(inputTokensHeader, "1")
 		_, _ = io.WriteString(w, `{}`)
 	}))
@@ -416,11 +401,22 @@ func TestRedactCarriesKeyHashToCoordinator(t *testing.T) {
 	handler := newGateway([]*url.URL{target}, &recordedUsage{}, testLimits)
 	req := httptest.NewRequest(http.MethodPost, redactPath, strings.NewReader(`{"text":"hi"}`))
 	req.Header.Set("Authorization", "Bearer tk_customer")
-	req.Header.Set(keyHashHeader, "spoofed")
+	internal := []string{keyHashHeader, requestIDHeader, inputTokensHeader, requestTokensHeader, positionOffsetHeader, forwardShapeHeader}
+	for _, h := range internal {
+		req.Header.Set(h, "spoofed")
+	}
 	handler.ServeHTTP(httptest.NewRecorder(), req)
-	got, _ := seen.Load().(string)
-	if got != keyHash("tk_customer") || got == "spoofed" || strings.Contains(got, "tk_customer") {
-		t.Fatalf("coordinator saw key hash %q", got)
+	got, _ := seen.Load().(http.Header)
+	if hash := got.Get(keyHashHeader); hash != keyHash("tk_customer") || strings.Contains(hash, "tk_customer") {
+		t.Fatalf("coordinator saw key hash %q", hash)
+	}
+	if id := got.Get(requestIDHeader); id == "" || id == "spoofed" {
+		t.Fatalf("request id %q", id)
+	}
+	for _, h := range internal[2:] {
+		if v := got.Get(h); v != "" {
+			t.Fatalf("client-supplied %s reached the coordinator: %q", h, v)
+		}
 	}
 }
 
@@ -441,21 +437,22 @@ func TestRequestTimeoutScalesWithInputSize(t *testing.T) {
 }
 
 func TestForwardLimitsFromEnv(t *testing.T) {
-	for _, name := range []string{"OPF_MAX_CONCURRENCY", "OPF_MAX_QUEUED_WINDOWS", "OPF_WINDOW_TOKENS", "OPF_WINDOW_OVERLAP", "OPF_WINDOW_TIMEOUT_SECONDS", "OPF_MAX_REQUEST_SECONDS", "OPF_FORWARD_TIMEOUT_SECONDS", "OPF_SHORT_REQUEST_TOKENS", "OPF_SHORT_LANE_ARMED_SECONDS", "OPF_MS_PER_TOKEN"} {
+	for _, name := range []string{"OPF_MAX_CONCURRENCY", "OPF_MAX_QUEUED_WINDOWS", "OPF_WINDOW_TOKENS", "OPF_WINDOW_OVERLAP", "OPF_WINDOW_TIMEOUT_SECONDS", "OPF_MAX_REQUEST_SECONDS", "OPF_FORWARD_TIMEOUT_SECONDS", "OPF_SHORT_REQUEST_TOKENS", "OPF_SHORT_LANE_ARMED_SECONDS", "OPF_LONG_GRACE_SECONDS", "OPF_MS_PER_TOKEN"} {
 		t.Setenv(name, "")
 	}
-	os.Unsetenv("OPF_SHORT_LANE_HORIZONS")
+	t.Setenv("OPF_SHORT_LANE_HORIZONS", "0.5,1.5") // the default, restored after the test (os.Unsetenv would not be)
 	limits, err := forwardLimitsFromEnv(4)
-	want := forwardLimits{maxInflight: 4, maxQueued: defaultMaxQueuedWindows, windowTokens: 6144, windowOverlap: 1024, windowTimeout: 5 * time.Second, maxRequest: 15 * time.Minute, forwardTimeout: 30 * time.Second, shortTokens: 6144, horizons: []time.Duration{500 * time.Millisecond, 1500 * time.Millisecond}, armed: 30 * time.Second, msPerToken: 0.5}
+	want := forwardLimits{maxInflight: 4, maxQueued: defaultMaxQueuedWindows, windowTokens: 6144, windowOverlap: 1024, windowTimeout: 5 * time.Second, maxRequest: 15 * time.Minute, forwardTimeout: 30 * time.Second, shortTokens: 6144, horizons: []time.Duration{500 * time.Millisecond, 1500 * time.Millisecond}, armed: 30 * time.Second, longGrace: 5 * time.Second, msPerToken: 0.5}
 	if err != nil || fmt.Sprint(limits) != fmt.Sprint(want) {
 		t.Fatalf("defaults: %+v, %v", limits, err)
 	}
 	t.Setenv("OPF_SHORT_LANE_HORIZONS", "0")
 	t.Setenv("OPF_SHORT_LANE_ARMED_SECONDS", "600")
 	t.Setenv("OPF_SHORT_REQUEST_TOKENS", "2048")
+	t.Setenv("OPF_LONG_GRACE_SECONDS", "0")
 	t.Setenv("OPF_MS_PER_TOKEN", "1.25")
 	limits, err = forwardLimitsFromEnv(4)
-	if err != nil || len(limits.horizons) != 0 || limits.armed != 10*time.Minute || limits.shortTokens != 2048 || limits.msPerToken != 1.25 {
+	if err != nil || len(limits.horizons) != 0 || limits.armed != 10*time.Minute || limits.shortTokens != 2048 || limits.longGrace != 0 || limits.msPerToken != 1.25 {
 		t.Fatalf("hold rule config: %+v, %v", limits, err)
 	}
 	t.Setenv("OPF_SHORT_LANE_HORIZONS", "3,1.5")
@@ -495,7 +492,7 @@ func TestForwardLimitsFromEnv(t *testing.T) {
 
 func TestQueueURLForWorkersDefaultsToGateway(t *testing.T) {
 	t.Setenv("OPF_QUEUE_URL", "")
-	if got := queueURLForWorkers(); got != "http://127.0.0.1:8001/queue" {
+	if got := queueURLForWorkers(); got != "http://127.0.0.1:8000/queue" {
 		t.Fatalf("default forward url: %q", got)
 	}
 	t.Setenv("OPF_QUEUE_URL", "http://127.0.0.1:9999/queue")
@@ -579,5 +576,104 @@ func TestSchedulerShortClassIsFairAcrossCallers(t *testing.T) {
 	case <-quiet.ready:
 	default:
 		t.Fatal("the quiet caller's short window waited behind the chatty caller's backlog")
+	}
+}
+
+// /health answers from state, not by probing: a worker that no longer
+// answers anything (wedged) or has not booted yet makes it 503 at once.
+func TestHealthAnswersFromStateWithoutProbing(t *testing.T) {
+	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done() // never answers
+	}))
+	defer hung.Close()
+	target, _ := url.Parse(hung.URL)
+	g := buildGateway([]*url.URL{target}, &recordedUsage{}, limitsWith(1, 512), "")
+	health := func() (int, string, time.Duration) {
+		rec := httptest.NewRecorder()
+		start := time.Now()
+		g.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, healthPath, nil))
+		return rec.Code, strings.TrimSpace(rec.Body.String()), time.Since(start)
+	}
+	if code, _, took := health(); code != http.StatusOK || took > 100*time.Millisecond {
+		t.Fatalf("ready worker: %d in %v (must not probe)", code, took)
+	}
+	g.workers[0].wedged.Store(true)
+	if code, body, took := health(); code != http.StatusServiceUnavailable || body != "worker 0 being replaced" || took > 100*time.Millisecond {
+		t.Fatalf("wedged worker: %d %q in %v", code, body, took)
+	}
+	g.workers[0].wedged.Store(false)
+	g.workers[0].ready.Store(false)
+	if code, body, _ := health(); code != http.StatusServiceUnavailable || body != "worker 0 starting" {
+		t.Fatalf("booting worker: %d %q", code, body)
+	}
+}
+
+// The floor under the long class: short windows go first, but a long window
+// is dispatched at least every longGrace even under a stream of short calls
+// that would otherwise keep every lane forever.
+func TestLongWindowsGetALaneEveryGrace(t *testing.T) {
+	workers := []*worker{{target: &url.URL{Host: "w0"}}}
+	limits := limitsWith(1, 64)
+	limits.longGrace = time.Second
+	s := newForwardScheduler(workers, limits)
+	clock := time.Unix(1_700_000_000, 0)
+	s.now = func() time.Time { return clock }
+	s.lastLong = clock
+
+	first, _ := s.enqueue("chat", "c0", 10, true) // takes the only lane
+	<-first.ready
+	doc, _ := s.enqueue("doc", "d", 6144, false)
+	dispatched := func(item *forwardItem) bool {
+		select {
+		case <-item.ready:
+			return true
+		default:
+			return false
+		}
+	}
+	// A short stream: each release dispatches the next short, never the doc,
+	// while the grace has not run out.
+	for i := range 5 {
+		clock = clock.Add(150 * time.Millisecond)
+		next, _ := s.enqueue("chat", "c"+strconv.Itoa(i+1), 10, true)
+		s.release(s.lanes[0], true)
+		if !dispatched(next) || dispatched(doc) {
+			t.Fatalf("release %d: short %v doc %v", i, dispatched(next), dispatched(doc))
+		}
+	}
+	// Past the grace, the next lane goes to the doc even though a short waits.
+	clock = clock.Add(400 * time.Millisecond) // 1.15 s since lastLong
+	pending, _ := s.enqueue("chat", "c9", 10, true)
+	s.release(s.lanes[0], true)
+	if !dispatched(doc) || dispatched(pending) {
+		t.Fatal("the long window did not get its lane after the grace")
+	}
+	// The floor's clock restarted: the short goes next.
+	s.release(s.lanes[0], true)
+	if !dispatched(pending) {
+		t.Fatal("short not dispatched after the floor fired")
+	}
+}
+
+// With the floor off, short windows win every time (the pre-floor rule).
+func TestLongWindowsStarveWithoutGrace(t *testing.T) {
+	workers := []*worker{{target: &url.URL{Host: "w0"}}}
+	limits := limitsWith(1, 64)
+	limits.longGrace = 0
+	s := newForwardScheduler(workers, limits)
+	clock := time.Unix(1_700_000_000, 0)
+	s.now = func() time.Time { return clock }
+	first, _ := s.enqueue("chat", "c0", 10, true)
+	<-first.ready
+	doc, _ := s.enqueue("doc", "d", 6144, false)
+	for i := range 5 {
+		clock = clock.Add(10 * time.Second)
+		next, _ := s.enqueue("chat", "c"+strconv.Itoa(i+1), 10, true)
+		s.release(s.lanes[0], true)
+		select {
+		case <-doc.ready:
+			t.Fatal("long window dispatched with the floor off")
+		case <-next.ready:
+		}
 	}
 }

@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -43,6 +42,10 @@ type worker struct {
 	// back) and cleared when the supervisor has replaced the process. While
 	// set, the worker gets no new windows or requests and /health fails.
 	wedged atomic.Bool
+	// ready is set once the worker process has answered /health (the
+	// supervisor owns it; a gateway built without one starts ready) and
+	// cleared while it is being replaced.
+	ready atomic.Bool
 }
 
 // pickWorker chooses the worker to coordinate a /redact: fewest in flight,
@@ -63,7 +66,10 @@ func pickWorker(workers []*worker) *worker {
 // gateway is the front end plus the handles the supervisor needs: which
 // worker wedged, and a nudge to resume dispatch once it is back.
 type gateway struct {
-	http.Handler
+	http.Handler // the shim-facing API
+	// internal serves /queue for the workers; bound to a loopback-only
+	// listener in main, so a window post is never reachable from outside.
+	internal  http.Handler
 	workers   []*worker
 	scheduler *forwardScheduler
 	onWedge   func(worker int)
@@ -80,11 +86,11 @@ func (g *gateway) resume(int) { g.scheduler.dispatch() }
 // gateway's /forward. The forward scheduler queues windows per caller and
 // runs them on whichever worker has a free lane, so long documents use every
 // worker and short requests from other callers interleave with them.
-func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits) http.Handler {
+func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits) *gateway {
 	return buildGateway(targets, reporter, limits, "")
 }
 
-func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limits forwardLimits, usageContextSecret string) http.Handler {
+func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limits forwardLimits, usageContextSecret string) *gateway {
 	return buildGateway(targets, reporter, limits, usageContextSecret)
 }
 
@@ -113,23 +119,31 @@ func buildGateway(targets []*url.URL, reporter eventReporter, limits forwardLimi
 					r.Out.Header.Del(billableRequestsHeader)
 					r.Out.Header.Del(billableInputTokensHeader)
 					r.Out.Header.Del("Accept-Encoding")
-					r.Out.Header.Del(keyHashHeader)
-					r.Out.Header.Del(requestIDHeader)
-					r.Out.Header.Del(inputTokensHeader)
+					// Every internal X-Tinfoil-* header is minted here, never
+					// taken from the client.
+					for _, h := range []string{keyHashHeader, requestIDHeader, inputTokensHeader, requestTokensHeader, positionOffsetHeader, forwardShapeHeader} {
+						r.Out.Header.Del(h)
+					}
 				},
 				ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-					// Also reached when a 200 carried no token count: fail closed
-					// rather than return a result we cannot meter.
-					if !errors.Is(err, errMissingInputTokens) {
+					switch {
+					case r.Context().Err() != nil:
+						// The client hung up (or the request deadline passed):
+						// the designed cancel path, not a worker failure.
+						slog.Info("redact cancelled", "request", r.Header.Get(requestIDHeader), "error", r.Context().Err())
+					case errors.Is(err, errMissingInputTokens):
+						// A 200 carried no token count: fail closed rather than
+						// return a result we cannot meter (already logged).
+					default:
 						slog.Error("privacy filter upstream unavailable", "error", err, "worker", r.URL.Host)
 					}
 					http.Error(w, "privacy filter unavailable", http.StatusBadGateway)
 				},
 			},
 		}
+		workers[i].ready.Store(true) // a supervisor clears this before spawning
 	}
 
-	healthClient := &http.Client{Transport: transport, Timeout: healthProbeTimeout}
 	forwardClient := &http.Client{Transport: transport}
 	scheduler := newForwardScheduler(workers, limits)
 	var forwardTimeouts atomic.Int64
@@ -213,13 +227,10 @@ func buildGateway(targets []*url.URL, reporter eventReporter, limits forwardLimi
 		requestProxy.ServeHTTP(w, r.WithContext(ctx))
 	})
 	// Internal: one model forward over one window (binary in, binary out;
-	// the payloads are opaque here). Reached only from the coordinating
-	// workers on this host; the shim never exposes it.
-	mux.HandleFunc("POST "+queuePath, func(w http.ResponseWriter, r *http.Request) {
-		if !isLoopback(r.RemoteAddr) {
-			http.Error(w, "forward is internal", http.StatusForbidden)
-			return
-		}
+	// the payloads are opaque here). Served on its own loopback listener
+	// for the coordinating workers on this host; not part of the API.
+	internal := http.NewServeMux()
+	internal.HandleFunc("POST "+queuePath, func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
 		if err != nil {
 			http.Error(w, "invalid or oversized request body", http.StatusRequestEntityTooLarge)
@@ -285,6 +296,11 @@ func buildGateway(targets []*url.URL, reporter eventReporter, limits forwardLimi
 				http.Error(w, "privacy filter forward timed out", http.StatusGatewayTimeout)
 				return
 			}
+			if ctx.Err() != nil {
+				// The coordinator dropped this window: its /redact ended.
+				http.Error(w, "request no longer active", http.StatusConflict)
+				return
+			}
 			slog.Error("forward upstream unavailable", "error", err)
 			http.Error(w, "privacy filter unavailable", http.StatusBadGateway)
 			return
@@ -307,29 +323,19 @@ func buildGateway(targets []*url.URL, reporter eventReporter, limits forwardLimi
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
 	})
-	// Healthy means every worker is healthy: a single wedged worker must fail
-	// the container's healthcheck (and the boot gate) even while its siblings
-	// still serve, matching the single-worker semantics.
+	// Healthy means every worker is up and none is being replaced: a single
+	// wedged worker fails the container's healthcheck (and the boot gate)
+	// even while its siblings still serve. Answered from the supervisor's
+	// state, never by probing: a wedged worker does not answer, and a
+	// healthcheck that hangs reads as "down" rather than "degraded".
 	mux.HandleFunc("GET "+healthPath, func(w http.ResponseWriter, r *http.Request) {
-		var wg sync.WaitGroup
-		failures := make([]error, len(workers))
 		for i, wk := range workers {
-			wg.Add(1)
-			go func(i int, target *url.URL) {
-				defer wg.Done()
-				failures[i] = probeHealth(r.Context(), healthClient, target.String()+healthPath)
-			}(i, wk.target)
-		}
-		wg.Wait()
-		for i, wk := range workers {
-			if wk.wedged.Load() {
-				failures[i] = errors.New("forward timed out")
-			}
-		}
-		for i, err := range failures {
-			if err != nil {
-				slog.Warn("worker unhealthy", "worker", i, "error", err)
-				http.Error(w, fmt.Sprintf("worker %d unhealthy", i), http.StatusServiceUnavailable)
+			switch {
+			case wk.wedged.Load():
+				http.Error(w, fmt.Sprintf("worker %d being replaced", i), http.StatusServiceUnavailable)
+				return
+			case !wk.ready.Load():
+				http.Error(w, fmt.Sprintf("worker %d starting", i), http.StatusServiceUnavailable)
 				return
 			}
 		}
@@ -358,29 +364,13 @@ func buildGateway(targets []*url.URL, reporter eventReporter, limits forwardLimi
 		}
 		metricsProxy.ServeHTTP(w, r)
 	})
-	g.Handler, g.workers, g.scheduler = mux, workers, scheduler
+	g.Handler, g.internal, g.workers, g.scheduler = mux, internal, workers, scheduler
 	return g
 }
 
 type appendedBody struct {
 	io.Reader
 	io.Closer
-}
-
-func probeHealth(ctx context.Context, client *http.Client, url string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status %d", resp.StatusCode)
-	}
-	return nil
 }
 
 // parentContext is what a verified parent usage context contributes to the

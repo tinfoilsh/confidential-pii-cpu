@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -259,5 +260,42 @@ func TestSupervisorDoesNotProbeAWorkerStillBooting(t *testing.T) {
 	case err := <-s.fatal:
 		t.Fatalf("boot reported fatal: %v", err)
 	default:
+	}
+}
+
+// The supervisor owns /health's view: a worker is ready only once it has
+// answered, and not while being replaced.
+func TestSupervisorPublishesReadiness(t *testing.T) {
+	s, workers, _ := fakeSupervisor(t, 1, "")
+	if !workers[0].ready.Load() {
+		t.Fatal("booted worker not ready")
+	}
+	ready := make(chan int, 2)
+	s.onReady = func(i int) { ready <- i }
+	s.wedged(0)
+	select {
+	case <-ready:
+	case <-time.After(10 * time.Second):
+		t.Fatal("not replaced")
+	}
+	if !workers[0].ready.Load() || workers[0].wedged.Load() {
+		t.Fatal("replaced worker not ready")
+	}
+}
+
+// Stopping with a wedged worker does not wait WaitDelay for it: a process
+// that ignores SIGTERM (here: stopped) is killed outright.
+func TestSupervisorStopKillsWedgedWorkerAtOnce(t *testing.T) {
+	s, workers, cancel := fakeSupervisor(t, 1, "")
+	proc := func() *os.Process { s.mu.Lock(); defer s.mu.Unlock(); return s.procs[0].cmd.Process }()
+	if err := proc.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	workers[0].wedged.Store(true) // as the gateway's timeout would
+	start := time.Now()
+	cancel()
+	s.stop()
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("stop took %v with a stopped worker", took)
 	}
 }

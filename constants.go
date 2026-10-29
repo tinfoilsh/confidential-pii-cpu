@@ -4,6 +4,9 @@ import "time"
 
 const (
 	listenAddress = ":8001"
+	// queueAddress is the loopback-only listener for /queue: the workers'
+	// window posts never share a socket with the shim-facing API.
+	queueAddress  = "127.0.0.1:8000"
 	inferenceHost = "127.0.0.1"
 	// Signed usage context from a parent service: tolerated clock skew and
 	// the deepest nesting accepted (router -> websearch -> privacy filter).
@@ -75,11 +78,15 @@ const (
 	// 50k-token document at no document cost; 0.5 ms/token at 4 × 8 threads.
 	defaultShortLaneHorizon = "0.5,1.5"
 	defaultShortLaneArmed   = 30 * time.Second
-	defaultMsPerToken       = 0.5
-	shutdownTimeout         = 30 * time.Second
-	reportFlushTimeout      = 10 * time.Second
-	healthProbeInterval     = 30 * time.Second
-	healthProbeTimeout      = 5 * time.Second
+	// defaultLongGrace: the longest the long class waits behind short calls.
+	// If no long window has been dispatched for this long while some are
+	// queued, the next lane goes to one. Below saturation it never trips.
+	defaultLongGrace    = 5 * time.Second
+	defaultMsPerToken   = 0.5
+	shutdownTimeout     = 30 * time.Second
+	reportFlushTimeout  = 10 * time.Second
+	healthProbeInterval = 30 * time.Second
+	healthProbeTimeout  = 5 * time.Second
 	// Keep-alive hygiene on the loopback hops. uvicorn closes an idle
 	// keep-alive connection after workerKeepAlive; the gateway must drop its
 	// idle connections well before that, or a POST reused on a connection the
