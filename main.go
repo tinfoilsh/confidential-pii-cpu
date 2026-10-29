@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -86,9 +85,9 @@ func intEnv(name string, fallback, minimum int) (int, error) {
 func forwardLimitsFromEnv(workers int) (forwardLimits, error) {
 	var limits forwardLimits
 	var windowTimeout, maxRequest, forwardTimeout int
-	for _, retired := range []string{"OPF_MAX_CONCURRENCY", "OPF_FORWARD_FANOUT"} {
+	for _, retired := range []string{"OPF_MAX_CONCURRENCY", "OPF_FORWARD_FANOUT", "OPF_FORWARD_URL"} {
 		if os.Getenv(retired) != "" {
-			return forwardLimits{}, fmt.Errorf("%s is no longer a setting: each worker runs one forward at a time and posts every window of a request to the gateway queue", retired)
+			return forwardLimits{}, fmt.Errorf("%s is no longer a setting (one forward at a time per worker; windows go to the gateway /queue, OPF_QUEUE_URL)", retired)
 		}
 	}
 	for _, v := range []struct {
@@ -149,13 +148,13 @@ func floatEnv(name string, fallback float64) (float64, error) {
 }
 
 // secondsEnv reads a non-negative duration in seconds.
-// forwardURLForWorkers is the /forward endpoint handed to spawned workers:
-// OPF_FORWARD_URL when the deployment sets it, else this gateway's own.
-func forwardURLForWorkers() string {
-	if raw := strings.TrimSpace(os.Getenv("OPF_FORWARD_URL")); raw != "" {
+// queueURLForWorkers is the gateway /queue endpoint handed to spawned
+// workers: OPF_QUEUE_URL when the deployment sets it, else this gateway's own.
+func queueURLForWorkers() string {
+	if raw := strings.TrimSpace(os.Getenv("OPF_QUEUE_URL")); raw != "" {
 		return raw
 	}
-	return "http://" + inferenceHost + listenAddress + forwardPath
+	return "http://" + inferenceHost + listenAddress + queuePath
 }
 
 func secondsEnv(name string, fallback time.Duration) (time.Duration, error) {
@@ -220,55 +219,31 @@ func run(ctx context.Context) error {
 	backendCtx, stopBackend := context.WithCancel(context.Background())
 	defer stopBackend()
 
-	backendDone := make(chan error, workers)
-	unhealthy := make(chan error, workers)
 	targets := make([]*url.URL, workers)
-	backends := make([]*exec.Cmd, workers)
 	for i := range workers {
-		port := strconv.Itoa(inferenceBasePort + i)
-		backendURL := "http://" + inferenceHost + ":" + port
-		backend := exec.CommandContext(backendCtx, "uvicorn", "server:app", "--host", inferenceHost, "--port", port, "--no-access-log", "--timeout-keep-alive", strconv.Itoa(int(workerKeepAlive.Seconds())))
-		backend.Stdout, backend.Stderr = os.Stdout, os.Stderr
-		// Workers post their windows to this gateway's /forward unless the
-		// deployment points them elsewhere (unset in the worker means
-		// in-process, single-worker development).
-		backend.Env = append(os.Environ(), "OPF_FORWARD_URL="+forwardURLForWorkers())
-		backend.Cancel = func() error { return backend.Process.Signal(syscall.SIGTERM) }
-		backend.WaitDelay = shutdownTimeout
-		if err := backend.Start(); err != nil {
-			stopBackend()
-			for _, started := range backends[:i] {
-				_ = started.Wait()
-			}
-			return fmt.Errorf("start inference worker %d: %w", i, err)
-		}
-		backends[i] = backend
-		go func(worker int, cmd *exec.Cmd) {
-			err := cmd.Wait()
-			backendDone <- fmt.Errorf("inference worker %d exited unexpectedly: %v", worker, err)
-		}(i, backend)
-		targets[i], _ = url.Parse(backendURL)
-		// Exiting on a wedged worker lets Docker's restart policy replace the
-		// whole set; an unhealthy state alone never triggers a restart.
-		go func(worker int, failed <-chan error) {
-			if err, ok := <-failed; ok {
-				unhealthy <- fmt.Errorf("inference worker %d unhealthy: %w", worker, err)
-			}
-		}(i, watchHealth(backendCtx, backendURL+healthPath, healthProbeInterval))
+		targets[i], _ = url.Parse("http://" + inferenceHost + ":" + strconv.Itoa(inferenceBasePort+i))
+	}
+	// The platform signs parent usage contexts with USAGE_CONTEXT_SECRET,
+	// distinct from this reporter's own secret. Optional until websearch
+	// sends one; absent means contexts are ignored (a direct call).
+	front := buildGateway(targets, reporter, limits, strings.TrimSpace(os.Getenv("USAGE_CONTEXT_SECRET")))
+	supervisor := newWorkerSupervisor(backendCtx, front.workers)
+	supervisor.onReady = front.resume
+	front.onWedge = supervisor.wedged
+	if err := supervisor.startAll(); err != nil {
+		stopBackend()
+		supervisor.stop()
+		return err
 	}
 
-	server := &http.Server{Addr: listenAddress, Handler: newGatewayWithUsageContext(targets, reporter, limits, cfg.Secret), ReadHeaderTimeout: headerTimeout, ReadTimeout: limits.maxRequest, IdleTimeout: limits.maxRequest}
+	server := &http.Server{Addr: listenAddress, Handler: front, ReadHeaderTimeout: headerTimeout, ReadTimeout: limits.maxRequest, IdleTimeout: limits.maxRequest}
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.ListenAndServe() }()
 
 	var result error
-	backendsExited := 0
 	select {
 	case <-ctx.Done():
-	case err := <-backendDone:
-		backendsExited = 1
-		result = err
-	case err := <-unhealthy:
+	case err := <-supervisor.fatal:
 		result = err
 	case err := <-serverDone:
 		if !errors.Is(err, http.ErrServerClosed) {
@@ -282,8 +257,6 @@ func run(ctx context.Context) error {
 		result = errors.Join(result, err)
 	}
 	stopBackend()
-	for ; backendsExited < workers; backendsExited++ {
-		<-backendDone
-	}
+	supervisor.stop()
 	return result
 }

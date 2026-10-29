@@ -346,6 +346,9 @@ func (s *forwardScheduler) dispatchLocked() {
 	for s.inflight < len(s.lanes) && s.queued > 0 {
 		item, pop := s.nextLocked()
 		l := s.freeLaneLocked()
+		if l == nil {
+			return // every free lane belongs to a worker being replaced
+		}
 		if !item.short && s.holdActiveLocked() {
 			if wait := s.holdDelayLocked(l); wait > 0 {
 				s.holdSince = s.now()
@@ -429,10 +432,19 @@ func (s *forwardScheduler) etaLocked(l *lane, now time.Time) time.Duration {
 // freeLaneLocked picks a free lane on the worker with the fewest forwards
 // in flight. Lanes are spread evenly over workers, so whenever the global
 // cap allows a dispatch the least-busy worker has a free lane.
+// dispatch re-runs the scheduler, e.g. after a replaced worker is usable.
+func (s *forwardScheduler) dispatch() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dispatchLocked()
+}
+
+// freeLaneLocked picks the free lane on the least-loaded worker that is not
+// being replaced; nil when there is none.
 func (s *forwardScheduler) freeLaneLocked() *lane {
 	var best *lane
 	for _, l := range s.lanes {
-		if l.busy {
+		if l.busy || l.worker.wedged.Load() {
 			continue
 		}
 		if best == nil || l.worker.forwards < best.worker.forwards {

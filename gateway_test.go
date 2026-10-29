@@ -65,14 +65,14 @@ func TestGatewayOwnsBilling(t *testing.T) {
 				if r.Header.Get("Authorization") != "" || r.Header.Get(usage.HeaderContext) != "" {
 					t.Error("credentials or billing context reached model process")
 				}
-				if r.URL.Path == redactPath {
+				if r.URL.Path == chunkPath {
 					body, _ := io.ReadAll(r.Body)
 					if string(body) != query {
 						t.Errorf("body changed: %s", body)
 					}
 				}
 				w.Header().Set("Content-Type", "application/json")
-				if r.URL.Path == redactPath {
+				if r.URL.Path == chunkPath {
 					w.Header().Set(inputTokensHeader, "7")
 				}
 				w.WriteHeader(tc.upstreamStatus)
@@ -313,8 +313,21 @@ func TestGatewayPropagatesUsageContext(t *testing.T) {
 		t.Fatalf("attributes: %+v", got)
 	}
 
+	if reporter.events[0].CustomerRequests != 1 {
+		t.Fatalf("parent billing the request: %+v", reporter.events[0])
+	}
+
+	// A parent that already counted the customer's request: tokens metered,
+	// no second request.
+	counted := parent
+	counted.BillCustomerRequest = false
+	reporter, code = call(t, func(h http.Header) { _ = usage.SetHeaders(h, counted, secret) })
+	if code != http.StatusOK || len(reporter.events) != 1 || reporter.events[0].CustomerRequests != 0 || reporter.events[0].Meters[0].Quantity != 3 {
+		t.Fatalf("parent-counted call: status %d, events %+v", code, reporter.events)
+	}
+
 	reporter, code = call(t, func(http.Header) {})
-	if code != http.StatusOK || len(reporter.events) != 1 || reporter.events[0].Attributes["parent_service"] != "" {
+	if code != http.StatusOK || len(reporter.events) != 1 || reporter.events[0].Attributes["parent_service"] != "" || reporter.events[0].CustomerRequests != 1 {
 		t.Fatalf("direct call: status %d, events %+v", code, reporter.events)
 	}
 
@@ -342,7 +355,7 @@ func TestGatewayCancelsQueuedWindowsWhenRedactEnds(t *testing.T) {
 	// The "coordinator" backend: records the request id the gateway minted
 	// and hangs until the client gives up.
 	coordinator := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == redactPath {
+		if r.URL.Path == chunkPath {
 			_, _ = io.Copy(io.Discard, r.Body) // read, as a real worker does; the server only watches for disconnects after
 			workerSawRequestID <- r.Header.Get(requestIDHeader)
 			<-r.Context().Done()
@@ -374,7 +387,7 @@ func TestGatewayCancelsQueuedWindowsWhenRedactEnds(t *testing.T) {
 	type result struct{ status int }
 	results := make(chan result, 3)
 	post := func(id string) {
-		req, _ := http.NewRequest(http.MethodPost, gateway.URL+forwardPath, bytes.NewReader(make([]byte, 4)))
+		req, _ := http.NewRequest(http.MethodPost, gateway.URL+queuePath, bytes.NewReader(make([]byte, 4)))
 		req.Header.Set("Content-Type", "application/octet-stream")
 		req.Header.Set(keyHashHeader, "caller")
 		req.Header.Set(requestIDHeader, id)

@@ -7,10 +7,11 @@ HuggingFace download or egress required.
 
 Each process plays two roles:
 
-- coordinator: /redact tokenizes the input, cuts it into overlapping
-  windows (chunking.py) and posts every window at once — to the gateway's
-  /forward when OPF_FORWARD_URL is set, whose queue schedules them fairly
-  across callers and every worker's lane, or in-process otherwise — then
+- coordinator: /chunk (where the gateway proxies a client's /redact)
+  tokenizes the input, cuts it into overlapping windows (chunking.py) and
+  posts every window at once — to the gateway's /queue when OPF_QUEUE_URL
+  is set, which schedules them fairly across callers and every worker's
+  lane, or in-process otherwise — then
   stitches the per-token scores together and runs the unchanged global
   decode. When the gateway ends the request (answered, timed out, client
   gone) it refuses the request's remaining windows and the coordinator
@@ -46,6 +47,8 @@ from chunking import check_geometry, kept_outputs, plan_windows, required_overla
 
 log = logging.getLogger("privacy-filter")
 logging.basicConfig(level=logging.INFO)
+# httpx logs one INFO line per request: that is one per window.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 CHECKPOINT_DIR = os.environ.get(
     "OPF_CHECKPOINT", "/tinfoil/models/privacy-filter/original"
@@ -57,24 +60,29 @@ DEVICE = os.environ.get("OPF_DEVICE", "cpu")
 # checkpoint config) so every kept token's scores equal a single long pass.
 WINDOW_TOKENS = int(os.environ.get("OPF_WINDOW_TOKENS", "6144"))
 WINDOW_OVERLAP = int(os.environ.get("OPF_WINDOW_OVERLAP", "1024"))
+# Largest input accepted, in tokens; longer inputs are refused with 413 and
+# the limit in the message. Chunking is exact at any length; the cap keeps
+# absolute positions well inside the range the model was validated at
+# (exact and clean to 50k in the lab; the position table runs to 131k).
+MAX_INPUT_TOKENS = int(os.environ.get("OPF_MAX_INPUT_TOKENS", "80000"))
 # The gateway's forward dispatcher. Unset means run windows in this process.
-FORWARD_URL = os.environ.get("OPF_FORWARD_URL") or None
+QUEUE_URL = os.environ.get("OPF_QUEUE_URL") or None
 # A window may wait in the gateway queue for up to the request ceiling.
 FORWARD_TIMEOUT_SECONDS = float(os.environ.get("OPF_MAX_REQUEST_SECONDS", "900"))
 KEY_HASH_HEADER = "X-Tinfoil-Key-Hash"
 # The gateway's id for the /redact this coordinator is serving; echoed on
-# every /forward so the gateway can drop the request's queue when it ends.
+# every /queue post so the gateway can drop the request's queue when it ends.
 REQUEST_ID_HEADER = "X-Tinfoil-Request-ID"
 # Input token count returned to the gateway on every /redact response; the
 # gateway meters it on the usage event and strips it from the client response.
 INPUT_TOKENS_HEADER = "X-Tinfoil-Input-Tokens"
-# Total tokens of the owning request, sent on each /forward so the gateway
+# Total tokens of the owning request, sent on each /queue post so the gateway
 # can prioritise short requests.
 REQUEST_TOKENS_HEADER = "X-Tinfoil-Request-Tokens"
 # /forward speaks raw native little-endian int32 / float32; the shape of the
 # returned score matrix travels in this header as "rows,classes".
 SHAPE_HEADER = "X-Tinfoil-Shape"
-# A window's absolute token offset, sent on each /forward. The worker runs
+# A window's absolute token offset, sent with each window. The worker runs
 # the window at its true positions so the rotary angles are bit-for-bit
 # those of an unchunked pass; without it every window would restart at
 # position 0 and differ from the single-pass result by float32 angle
@@ -158,7 +166,8 @@ def load_model():
     from opf import OPF
 
     with open(os.path.join(CHECKPOINT_DIR, "config.json"), encoding="utf-8") as handle:
-        required = required_overlap(json.load(handle))
+        checkpoint_config = json.load(handle)
+    required = required_overlap(checkpoint_config)
     check_geometry(WINDOW_TOKENS, WINDOW_OVERLAP, required)
     log.info(
         "Window geometry %d/%d (receptive field %d)",
@@ -184,12 +193,12 @@ def load_model():
     elif compute_dtype not in ("checkpoint", "float32"):
         raise ValueError(f"Unsupported OPF_COMPUTE_DTYPE: {compute_dtype!r}")
     _encoding = _runtime.encoding
-    _init_rotary_offsets(_runtime.model)
-    for retired in ("OPF_MAX_CONCURRENCY", "OPF_FORWARD_FANOUT"):
+    _init_rotary_offsets(_runtime.model, int(checkpoint_config["num_hidden_layers"]))
+    for retired in ("OPF_MAX_CONCURRENCY", "OPF_FORWARD_FANOUT", "OPF_FORWARD_URL"):
         if os.environ.get(retired):
-            raise ValueError(f"{retired} is no longer a setting: one forward at a time per worker")
+            raise ValueError(f"{retired} is no longer a setting (one forward at a time per worker; windows go to OPF_QUEUE_URL)")
     _semaphore = asyncio.Semaphore(1)
-    if FORWARD_URL is not None:
+    if QUEUE_URL is not None:
         _forward_client = httpx.AsyncClient(
             timeout=FORWARD_TIMEOUT_SECONDS,
             limits=httpx.Limits(max_connections=None, max_keepalive_connections=64),
@@ -200,7 +209,7 @@ def load_model():
         DEVICE,
         WINDOW_TOKENS,
         WINDOW_OVERLAP,
-        FORWARD_URL or "in-process",
+        QUEUE_URL or "in-process",
     )
 
 
@@ -239,32 +248,51 @@ class RedactResponse(BaseModel):
 _rotary_modules: list = []
 
 
-def _init_rotary_offsets(model) -> None:
-    """Keep every rotary module's full cos/sin tables so a window can be run
-    at an absolute position offset (see POSITION_OFFSET_HEADER)."""
+def _init_rotary_offsets(model, layers: int) -> None:
+    """Find every rotary module so a window can be run at an absolute
+    position offset (see POSITION_OFFSET_HEADER), and keep each module's
+    original tables to restore between forwards."""
     global _rotary_modules
     _rotary_modules = [
         m for m in model.modules() if type(m).__name__ == "RotaryEmbedding"
     ]
+    if len(_rotary_modules) != layers:
+        # Every attention layer owns one; a miss would silently run windows
+        # at position 0 and break exactness.
+        raise RuntimeError(
+            f"found {len(_rotary_modules)} RotaryEmbedding modules, expected {layers}"
+        )
     for rope in _rotary_modules:
-        rope._tinfoil_cos_full = rope.cos_cache
-        rope._tinfoil_sin_full = rope.sin_cache
+        rope._tinfoil_cos_default = rope.cos_cache
+        rope._tinfoil_sin_default = rope.sin_cache
     log.info("Rotary position offsets enabled on %d module(s)", len(_rotary_modules))
 
 
+def _rotary_rows(rope, offset: int, length: int):
+    """cos/sin rows for absolute positions [offset, offset+length): the same
+    elementwise t·inv_freq the module's own table holds, computed for just
+    these rows so nothing grows with the largest position ever seen."""
+    import torch
+
+    concentration, inv_freq = rope._compute_concentration_and_inv_freq(
+        device=rope._tinfoil_cos_default.device
+    )
+    t = torch.arange(offset, offset + length, dtype=torch.float32, device=inv_freq.device)
+    freqs = torch.einsum("i,j->ij", t, inv_freq)
+    return (freqs.cos() * concentration).to(rope.dtype), (freqs.sin() * concentration).to(rope.dtype)
+
+
 def _set_rotary_offset(offset: int, length: int) -> None:
-    """Point the rotary caches at rows [offset, offset+length). opf slices
-    `cos_cache[:num_tokens]`, so a view starting at `offset` yields the
-    true absolute positions. The caller holds the forward semaphore, so
-    the module state is not shared with another forward."""
+    """Point the rotary caches at rows for [offset, offset+length). opf
+    slices `cos_cache[:num_tokens]`, so a table whose row 0 is position
+    `offset` yields the true absolute positions. One forward runs at a time
+    per process, so the module state is not shared with another forward."""
     for rope in _rotary_modules:
-        full_cos, full_sin = rope._tinfoil_cos_full, rope._tinfoil_sin_full
-        if offset + length > full_cos.shape[0]:
-            cos, sin = rope._compute_cos_sin(offset + length, device=full_cos.device)
-            rope._tinfoil_cos_full, rope._tinfoil_sin_full = cos, sin
-            full_cos, full_sin = cos, sin
-        rope.cos_cache = full_cos[offset:]
-        rope.sin_cache = full_sin[offset:]
+        if offset == 0 and length <= rope._tinfoil_cos_default.shape[0]:
+            rope.cos_cache = rope._tinfoil_cos_default
+            rope.sin_cache = rope._tinfoil_sin_default
+        else:
+            rope.cos_cache, rope.sin_cache = _rotary_rows(rope, offset, length)
 
 
 def forward_tokens(
@@ -338,21 +366,21 @@ async def run_window(
     """Score one window: on this process, or via the gateway's fair queue."""
     start = time.time()
     try:
-        if FORWARD_URL is None:
+        if QUEUE_URL is None:
             async with _semaphore:
                 payload, classes = await run_in_threadpool(
                     forward_tokens, tokens, position_offset
                 )
             return scores_view(payload, len(tokens), classes)
-        # A transport failure or a malformed reply (missing shape header,
-        # short body) is retried once: the window is idempotent and cheap
-        # next to failing a whole multi-window request. Status replies
-        # (503 capacity, 504 wedge) are not retried; they carry meaning.
+        # A transport failure, a malformed reply (missing shape header, short
+        # body) or a wedged worker (504) is retried once: the window is
+        # idempotent and cheap next to failing a whole multi-window request.
+        # 503 (capacity) and 409 (request ended) are not retried.
         last_error = None
         for attempt in range(2):
             try:
                 response = await _forward_client.post(
-                    FORWARD_URL,
+                    QUEUE_URL,
                     content=array("i", tokens).tobytes(),
                     headers={
                         "Content-Type": OCTET_STREAM,
@@ -379,8 +407,16 @@ async def run_window(
                     raise HTTPException(
                         status_code=503, detail="privacy filter is at capacity"
                     )
-                # Includes 504: a forward exceeded the gateway's per-window
-                # deadline. The whole request fails; nothing partial is returned.
+                if response.status_code == 409:
+                    # The gateway ended this request (client gone, deadline);
+                    # fail fast so the task group cancels the rest.
+                    raise HTTPException(status_code=409, detail="request no longer active")
+                if response.status_code == 504:
+                    # The worker that took this window wedged; the gateway is
+                    # replacing it and routes a re-queued window elsewhere.
+                    last_error = "forward timed out (worker being replaced)"
+                    log.warning("window @%d (%d tokens) attempt %d: %s", position_offset, len(tokens), attempt + 1, last_error)
+                    continue
                 raise HTTPException(
                     status_code=502,
                     detail=f"forward failed with status {response.status_code}",
@@ -462,13 +498,18 @@ async def forward(request: Request):
     )
 
 
-@app.post("/redact", response_model=RedactResponse)
+@app.post("/chunk", response_model=RedactResponse)
 async def redact(req: RedactRequest, request: Request, response: Response):
     REQUESTS_RUNNING.inc()
     start = time.time()
     status = "success"
     try:
         tokens = [int(tok) for tok in _encoding.encode(req.text, allowed_special="all")]
+        if len(tokens) > MAX_INPUT_TOKENS:
+            raise HTTPException(
+                status_code=413,
+                detail=f"input is {len(tokens)} tokens; the limit is {MAX_INPUT_TOKENS}",
+            )
         plans = plan_windows(len(tokens), WINDOW_TOKENS, WINDOW_OVERLAP)
         WINDOWS_TOTAL.inc(len(plans))
         key_hash = request.headers.get(KEY_HASH_HEADER, "")

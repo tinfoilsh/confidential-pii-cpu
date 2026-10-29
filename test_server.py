@@ -74,7 +74,7 @@ def stubbed(monkeypatch):
     monkeypatch.setattr(server, "finish", finisher)
     monkeypatch.setattr(server, "WINDOW_TOKENS", 1024)
     monkeypatch.setattr(server, "WINDOW_OVERLAP", 128)
-    monkeypatch.setattr(server, "FORWARD_URL", None)
+    monkeypatch.setattr(server, "QUEUE_URL", None)
     monkeypatch.setattr(server, "_forward_client", None)
     return finisher
 
@@ -154,7 +154,7 @@ def test_redact_in_process_stitches_windows_like_one_pass(stubbed):
 
     async def go():
         async with client() as c:
-            return await c.post("/redact", json={"text": text_of(n)})
+            return await c.post("/chunk", json={"text": text_of(n)})
 
     response = run(go())
     assert response.status_code == 200
@@ -171,7 +171,7 @@ def test_redact_in_process_stitches_windows_like_one_pass(stubbed):
 def test_redact_empty_text_runs_no_windows(stubbed):
     async def go():
         async with client() as c:
-            return await c.post("/redact", json={"text": ""})
+            return await c.post("/chunk", json={"text": ""})
 
     response = run(go())
     assert response.status_code == 200
@@ -182,7 +182,7 @@ def test_redact_empty_text_runs_no_windows(stubbed):
 
 @pytest.fixture
 def remote(stubbed, monkeypatch):
-    """Route windows through a fake gateway /forward that records each call."""
+    """Route windows through a fake gateway /queue that records each call."""
     class Seen(list):
         fail_window = None
         in_flight = 0
@@ -220,7 +220,7 @@ def remote(stubbed, monkeypatch):
             },
         )
 
-    monkeypatch.setattr(server, "FORWARD_URL", "http://gateway/forward")
+    monkeypatch.setattr(server, "QUEUE_URL", "http://gateway/queue")
     monkeypatch.setattr(
         server, "_forward_client", httpx.AsyncClient(transport=httpx.MockTransport(handler))
     )
@@ -234,7 +234,7 @@ def test_redact_fans_windows_out_through_the_gateway(stubbed, remote):
     async def go():
         async with client() as c:
             return await c.post(
-                "/redact",
+                "/chunk",
                 json={"text": text_of(n)},
                 headers={server.KEY_HASH_HEADER: "caller-hash", server.REQUEST_ID_HEADER: "req-1"},
             )
@@ -257,7 +257,7 @@ def test_redact_reports_capacity_when_the_gateway_refuses_a_window(stubbed, remo
 
     async def go():
         async with client() as c:
-            return await c.post("/redact", json={"text": text_of(5000)})
+            return await c.post("/chunk", json={"text": text_of(5000)})
 
     response = run(go())
     assert response.status_code == 503
@@ -270,3 +270,46 @@ def test_health(stubbed):
             return await c.get("/health")
 
     assert run(go()).status_code == 200
+
+
+def test_redact_refuses_inputs_over_the_token_cap(stubbed, monkeypatch):
+    monkeypatch.setattr(server, "MAX_INPUT_TOKENS", 5000)
+
+    async def go(n):
+        async with client() as c:
+            return await c.post("/chunk", json={"text": text_of(n)})
+
+    assert run(go(5000)).status_code == 200
+    over = run(go(5001))
+    assert over.status_code == 413
+    assert "5001 tokens" in over.json()["detail"] and "5000" in over.json()["detail"]
+    assert len(stubbed.calls) == 1  # the refused input never reached the model
+
+
+def test_rotary_rows_match_the_full_table():
+    """The per-window rows must equal the corresponding rows of the module's
+    own table: that is what makes a window at an offset exactly a slice of
+    the single pass."""
+    torch = pytest.importorskip("torch")
+
+    class Rope:
+        dtype = torch.float32
+
+        def __init__(self):
+            self.inv_freq = 1.0 / (10000 ** (torch.arange(0, 8, 2, dtype=torch.float32) / 8))
+            t = torch.arange(300, dtype=torch.float32)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            self.cos_cache, self.sin_cache = freqs.cos() * 1.5, freqs.sin() * 1.5
+            self._tinfoil_cos_default, self._tinfoil_sin_default = self.cos_cache, self.sin_cache
+
+        def _compute_concentration_and_inv_freq(self, device=None):
+            return 1.5, self.inv_freq
+
+    rope = Rope()
+    cos, sin = server._rotary_rows(rope, 100, 50)
+    assert cos.shape == (50, 4)
+    assert torch.equal(cos, rope._tinfoil_cos_default[100:150])
+    assert torch.equal(sin, rope._tinfoil_sin_default[100:150])
+    # beyond the module's own table, same formula
+    cos2, _ = server._rotary_rows(rope, 1_000_000, 3)
+    assert cos2.shape == (3, 4) and torch.isfinite(cos2).all()

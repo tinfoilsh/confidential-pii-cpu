@@ -10,12 +10,17 @@ const (
 	usageContextMaxSkew  = 10 * time.Minute
 	usageContextMaxDepth = 4
 	// Catalog model name the usage event is billed under.
-	billingModel           = "pii-filter"
-	inferenceBasePort      = 8002
-	maxWorkers             = 8
-	controlplaneURL        = "https://api.tinfoil.sh"
-	reporterID             = "pii-filter"
-	redactPath             = "/redact"
+	billingModel      = "pii-filter"
+	inferenceBasePort = 8002
+	maxWorkers        = 8
+	controlplaneURL   = "https://api.tinfoil.sh"
+	reporterID        = "pii-filter"
+	redactPath        = "/redact"
+	// Gateway: a window waits here for a lane. Worker: /chunk coordinates
+	// one /redact (tokenize, cut, post windows to /queue, stitch, decode);
+	// /forward runs the model over one window.
+	queuePath              = "/queue"
+	chunkPath              = "/chunk"
 	forwardPath            = "/forward"
 	healthPath             = "/health"
 	metricsPath            = "/metrics"
@@ -84,4 +89,11 @@ const (
 	workerKeepAlive        = 120 * time.Second
 	workerIdleConnTimeout  = 30 * time.Second
 	healthFailureThreshold = 3
+	// A wedged or dead worker is replaced in place; more than
+	// maxWorkerRestarts replacements of one worker within workerRestartWindow,
+	// or a replacement that is not healthy within workerBootTimeout, exits the
+	// process so the container is replaced.
+	maxWorkerRestarts   = 3
+	workerRestartWindow = 10 * time.Minute
+	workerBootTimeout   = 5 * time.Minute
 )

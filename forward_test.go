@@ -81,7 +81,7 @@ func forwardRequest(t *testing.T, gateway, key string) (int, time.Duration) {
 // of requestTokens tokens in total.
 func forwardWindow(t *testing.T, gateway, key string, tokens, requestTokens int) (int, time.Duration) {
 	t.Helper()
-	req, _ := http.NewRequest(http.MethodPost, gateway+forwardPath, bytes.NewReader(make([]byte, 4*tokens)))
+	req, _ := http.NewRequest(http.MethodPost, gateway+queuePath, bytes.NewReader(make([]byte, 4*tokens)))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set(keyHashHeader, key)
 	req.Header.Set(requestTokensHeader, strconv.Itoa(requestTokens))
@@ -197,7 +197,7 @@ func TestForwardRelaysBinaryPayloadAndShape(t *testing.T) {
 	target, _ := url.Parse(worker.URL)
 	gateway := httptest.NewServer(newGateway([]*url.URL{target}, &recordedUsage{}, testLimits))
 	defer gateway.Close()
-	req, _ := http.NewRequest(http.MethodPost, gateway.URL+forwardPath, bytes.NewReader([]byte{9, 0, 0, 0}))
+	req, _ := http.NewRequest(http.MethodPost, gateway.URL+queuePath, bytes.NewReader([]byte{9, 0, 0, 0}))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -389,7 +389,7 @@ func TestForwardIsLoopbackOnly(t *testing.T) {
 		{"192.0.2.1:4242", http.StatusForbidden},
 		{"172.31.255.1:4242", http.StatusForbidden},
 	} {
-		req := httptest.NewRequest(http.MethodPost, forwardPath, bytes.NewReader([]byte{1, 0, 0, 0}))
+		req := httptest.NewRequest(http.MethodPost, queuePath, bytes.NewReader([]byte{1, 0, 0, 0}))
 		req.RemoteAddr = tc.remote
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
@@ -493,13 +493,13 @@ func TestForwardLimitsFromEnv(t *testing.T) {
 	}
 }
 
-func TestForwardURLForWorkersDefaultsToGateway(t *testing.T) {
-	t.Setenv("OPF_FORWARD_URL", "")
-	if got := forwardURLForWorkers(); got != "http://127.0.0.1:8001/forward" {
+func TestQueueURLForWorkersDefaultsToGateway(t *testing.T) {
+	t.Setenv("OPF_QUEUE_URL", "")
+	if got := queueURLForWorkers(); got != "http://127.0.0.1:8001/queue" {
 		t.Fatalf("default forward url: %q", got)
 	}
-	t.Setenv("OPF_FORWARD_URL", "http://127.0.0.1:9999/forward")
-	if got := forwardURLForWorkers(); got != "http://127.0.0.1:9999/forward" {
+	t.Setenv("OPF_QUEUE_URL", "http://127.0.0.1:9999/queue")
+	if got := queueURLForWorkers(); got != "http://127.0.0.1:9999/queue" {
 		t.Fatalf("override forward url: %q", got)
 	}
 }

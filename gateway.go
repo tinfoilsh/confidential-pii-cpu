@@ -33,25 +33,44 @@ type eventReporter interface {
 // with its own interpreter and thread pool — serve concurrent requests
 // without contending on a shared lock.
 type worker struct {
+	index    int
 	target   *url.URL
 	proxy    *httputil.ReverseProxy
 	inflight atomic.Int64 // /redact requests being coordinated
 	forwards int          // model forwards running; guarded by forwardScheduler.mu
-	// wedged is set when a forward on this worker exceeded forwardTimeout.
-	// It is sticky: /health fails until the container is replaced, since a
-	// forward that outlived ~40 windows' worth of time is not coming back.
+	// wedged is set when a forward on this worker exceeded forwardTimeout
+	// (a forward that outlived ~10 windows' worth of time is not coming
+	// back) and cleared when the supervisor has replaced the process. While
+	// set, the worker gets no new windows or requests and /health fails.
 	wedged atomic.Bool
 }
 
+// pickWorker chooses the worker to coordinate a /redact: fewest in flight,
+// skipping any being replaced. nil when none is usable.
 func pickWorker(workers []*worker) *worker {
-	best := workers[0]
-	for _, w := range workers[1:] {
-		if w.inflight.Load() < best.inflight.Load() {
+	var best *worker
+	for _, w := range workers {
+		if w.wedged.Load() {
+			continue
+		}
+		if best == nil || w.inflight.Load() < best.inflight.Load() {
 			best = w
 		}
 	}
 	return best
 }
+
+// gateway is the front end plus the handles the supervisor needs: which
+// worker wedged, and a nudge to resume dispatch once it is back.
+type gateway struct {
+	http.Handler
+	workers   []*worker
+	scheduler *forwardScheduler
+	onWedge   func(worker int)
+}
+
+// resume lets the scheduler use a replaced worker again.
+func (g *gateway) resume(int) { g.scheduler.dispatch() }
 
 // The shim authenticates the bearer credential before this handler is reached.
 // The inference servers are private; only this handler emits billing events.
@@ -62,14 +81,19 @@ func pickWorker(workers []*worker) *worker {
 // runs them on whichever worker has a free lane, so long documents use every
 // worker and short requests from other callers interleave with them.
 func newGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits) http.Handler {
-	return newGatewayWithUsageContext(targets, reporter, limits, "")
+	return buildGateway(targets, reporter, limits, "")
+}
+
+func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limits forwardLimits, usageContextSecret string) http.Handler {
+	return buildGateway(targets, reporter, limits, usageContextSecret)
 }
 
 // newGatewayWithUsageContext also verifies the signed usage context a parent
 // service (websearch under a router chat) sends with a call, so the usage
 // event carries root_request_id / parent_service / depth and the control
 // plane can tell a nested tool call from a customer's own request.
-func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limits forwardLimits, usageContextSecret string) http.Handler {
+func buildGateway(targets []*url.URL, reporter eventReporter, limits forwardLimits, usageContextSecret string) *gateway {
+	g := &gateway{}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = limits.maxRequest
 	transport.DisableCompression = true
@@ -77,6 +101,7 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 	workers := make([]*worker, len(targets))
 	for i, target := range targets {
 		workers[i] = &worker{
+			index:  i,
 			target: target,
 			proxy: &httputil.ReverseProxy{
 				Transport: transport,
@@ -116,7 +141,7 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 			http.Error(w, "bearer credential required", http.StatusUnauthorized)
 			return
 		}
-		contextAttributes, err := usageContextAttributes(r.Header, parts[1], usageContextSecret)
+		parent, err := usageContext(r.Header, parts[1], usageContextSecret)
 		if err != nil {
 			slog.Warn("rejected usage context", "error", err)
 			http.Error(w, "invalid usage context", http.StatusBadRequest)
@@ -132,6 +157,10 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 		ctx, cancel := context.WithTimeout(r.Context(), limits.requestTimeout(len(body)))
 		defer cancel()
 		picked := pickWorker(workers)
+		if picked == nil {
+			http.Error(w, "privacy filter unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		picked.inflight.Add(1)
 		defer picked.inflight.Add(-1)
 		requestProxy := *picked.proxy
@@ -141,6 +170,7 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 		defer scheduler.cancelRequest(requestID)
 		requestProxy.Rewrite = func(pr *httputil.ProxyRequest) {
 			baseRewrite(pr)
+			pr.Out.URL.Path = chunkPath // the worker coordinates this /redact
 			pr.Out.Header.Set(keyHashHeader, hash)
 			pr.Out.Header.Set(requestIDHeader, requestID)
 		}
@@ -159,16 +189,21 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 				}
 				// Reported in the router's model_request shape so the control
 				// plane prices it from the model catalog: input tokens at the
-				// per-token rate plus the per-request price (the floor). The
-				// pii-filter:redact per-request entry is the fallback for
-				// enclaves that predate the token meter.
+				// per-token rate plus the per-request price (the floor). A
+				// parent that already counted the customer's request (its
+				// context says so) is not charged a second request; the
+				// tokens still are, as in websearch.
+				customerRequests := int64(1)
+				if !parent.billRequest {
+					customerRequests = 0
+				}
 				reporter.AddEvent(usage.Event{
 					RequestID:        requestID,
 					APIKey:           parts[1],
 					Operation:        usage.Operation{Service: usage.ServiceRouter, Name: usage.OperationRouterModelRequest},
-					CustomerRequests: 1,
+					CustomerRequests: customerRequests,
 					Meters:           []usage.Meter{{Name: usage.MeterInputTokens, Quantity: inputTokens}},
-					Attributes:       eventAttributes(contextAttributes),
+					Attributes:       eventAttributes(parent.attributes),
 				})
 				resp.Header.Set(billableRequestsHeader, "1")
 				resp.Header.Set(billableInputTokensHeader, strconv.FormatInt(inputTokens, 10))
@@ -180,7 +215,7 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 	// Internal: one model forward over one window (binary in, binary out;
 	// the payloads are opaque here). Reached only from the coordinating
 	// workers on this host; the shim never exposes it.
-	mux.HandleFunc("POST "+forwardPath, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST "+queuePath, func(w http.ResponseWriter, r *http.Request) {
 		if !isLoopback(r.RemoteAddr) {
 			http.Error(w, "forward is internal", http.StatusForbidden)
 			return
@@ -244,6 +279,9 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 				forwardTimeouts.Add(1)
 				picked.wedged.Store(true)
 				slog.Error("forward timed out; worker marked unhealthy", "worker", picked.target.Host, "timeout", limits.forwardTimeout)
+				if g.onWedge != nil {
+					go g.onWedge(picked.index)
+				}
 				http.Error(w, "privacy filter forward timed out", http.StatusGatewayTimeout)
 				return
 			}
@@ -320,7 +358,8 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 		}
 		metricsProxy.ServeHTTP(w, r)
 	})
-	return mux
+	g.Handler, g.workers, g.scheduler = mux, workers, scheduler
+	return g
 }
 
 type appendedBody struct {
@@ -344,26 +383,36 @@ func probeHealth(ctx context.Context, client *http.Client, url string) error {
 	return nil
 }
 
-// usageContextAttributes verifies the parent's signed usage context, if any,
-// and returns the attributes it contributes to the usage event. No context
-// (a direct customer call) yields no attributes; a present but invalid one
-// is an error, as in websearch.
-func usageContextAttributes(header http.Header, apiKey, secret string) (map[string]string, error) {
+// parentContext is what a verified parent usage context contributes to the
+// usage event: nesting attributes, and whether the parent has already
+// counted this call as the customer's request.
+type parentContext struct {
+	attributes map[string]string
+	// billRequest is false when the parent says it already counted the
+	// customer request; the filter's own per-call fee still applies.
+	billRequest bool
+}
+
+// usageContext verifies the parent's signed usage context, if any. No
+// context (a direct customer call) yields a direct, billable call; a present
+// but invalid one is an error, as in websearch.
+func usageContext(header http.Header, apiKey, secret string) (parentContext, error) {
+	direct := parentContext{billRequest: true}
 	if secret == "" {
-		return nil, nil
+		return direct, nil
 	}
 	ctx, present, err := usage.FromHeaders(header, secret, time.Now(), usageContextMaxSkew)
 	if err != nil {
-		return nil, err
+		return parentContext{}, err
 	}
 	if !present {
-		return nil, nil
+		return direct, nil
 	}
 	if !usage.VerifyAPIKeyHash(apiKey, ctx.APIKeyHash) {
-		return nil, errors.New("usage context api key mismatch")
+		return parentContext{}, errors.New("usage context api key mismatch")
 	}
 	if ctx.Depth > usageContextMaxDepth {
-		return nil, fmt.Errorf("usage context depth %d exceeds %d", ctx.Depth, usageContextMaxDepth)
+		return parentContext{}, fmt.Errorf("usage context depth %d exceeds %d", ctx.Depth, usageContextMaxDepth)
 	}
 	attributes := map[string]string{}
 	if ctx.ContextID != "" {
@@ -378,7 +427,7 @@ func usageContextAttributes(header http.Header, apiKey, secret string) (map[stri
 	if ctx.Depth > 0 {
 		attributes["depth"] = strconv.Itoa(ctx.Depth)
 	}
-	return attributes, nil
+	return parentContext{attributes: attributes, billRequest: ctx.BillCustomerRequest}, nil
 }
 
 func eventAttributes(contextAttributes map[string]string) map[string]string {

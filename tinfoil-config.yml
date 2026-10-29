@@ -29,7 +29,10 @@ containers:
       # model's receptive field), so chunked output equals one long pass.
       - OPF_WINDOW_TOKENS: "6144"
       - OPF_WINDOW_OVERLAP: "1024"
-      # 503 only when the queue cannot drain; a 4 MiB request is ~250 windows.
+      # Inputs over this many tokens are refused (413). Exact at any length;
+      # the cap keeps positions inside the lab-validated range.
+      - OPF_MAX_INPUT_TOKENS: "80000"
+      # 503 only when the queue cannot drain; an 80k-token request is ~20 windows.
       - OPF_MAX_QUEUED_WINDOWS: "4096"
       # Wedge detector: a window exceeding this marks its worker unhealthy.
       - OPF_FORWARD_TIMEOUT_SECONDS: "30"
@@ -40,6 +43,7 @@ containers:
     secrets:
       - METRICS_API_KEY
       - USAGE_REPORTER_SECRET
+      - USAGE_CONTEXT_SECRET
     tmpfs:
       /tmp: size=512m,mode=1777,exec
       /root: size=2g,mode=0700,exec

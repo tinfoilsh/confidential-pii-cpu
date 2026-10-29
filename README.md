@@ -26,7 +26,7 @@ export USAGE_REPORTER_SECRET="your-usage-reporter-secret"
 go run .
 ```
 
-Long inputs are cut into overlapping windows that the Go gateway's internal `/forward` queue spreads across every worker process, fairly per caller; see [DEPLOYMENT.md](DEPLOYMENT.md) for the window geometry, limits, health checks, and usage reporting. Upstream `opf` changes are carried as [patches](patches/README.md) applied at image build.
+Long inputs are cut into overlapping windows that the Go gateway's internal `/queue` spreads across every worker process, fairly per caller; see [DEPLOYMENT.md](DEPLOYMENT.md) for the window geometry, limits, health checks, and usage reporting. Upstream `opf` changes are carried as [patches](patches/README.md) applied at image build.
 
 ## Reporting Vulnerabilities
 
