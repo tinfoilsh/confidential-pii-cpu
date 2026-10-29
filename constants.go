@@ -20,6 +20,10 @@ const (
 	healthPath             = "/health"
 	metricsPath            = "/metrics"
 	billableRequestsHeader = "X-Tinfoil-Billable-Requests"
+	// Billing receipt detail: the input tokens metered for this request, so
+	// a calling service (websearch) can carry the per-token part of the fee
+	// up to the router's cost trailer alongside the request count.
+	billableInputTokensHeader = "X-Tinfoil-Billable-Input-Tokens"
 	// keyHashHeader carries a hash of the caller's credential from the /redact
 	// proxy to the coordinating worker, which echoes it on every /forward it
 	// fans out, so the forward scheduler can queue windows per caller.

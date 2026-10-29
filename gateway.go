@@ -86,6 +86,7 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 					r.Out.Header.Del(usage.HeaderContext)
 					r.Out.Header.Del(usage.HeaderUsageContextSignature)
 					r.Out.Header.Del(billableRequestsHeader)
+					r.Out.Header.Del(billableInputTokensHeader)
 					r.Out.Header.Del("Accept-Encoding")
 					r.Out.Header.Del(keyHashHeader)
 					r.Out.Header.Del(inputTokensHeader)
@@ -140,11 +141,12 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 		}
 		requestProxy.ModifyResponse = func(resp *http.Response) error {
 			resp.Header.Del(billableRequestsHeader)
-			// The coordinator reports the input token count it tokenized; it
-			// rides on the usage event as an input_tokens meter (one billable
-			// request as before) and never reaches the client.
+			// The coordinator reports the input token count it tokenized on an
+			// internal header; it rides on the usage event as an input_tokens
+			// meter and is echoed back as the billing receipt detail.
 			inputTokens, err := strconv.ParseInt(resp.Header.Get(inputTokensHeader), 10, 64)
 			resp.Header.Del(inputTokensHeader)
+			resp.Header.Del(billableInputTokensHeader)
 			if resp.StatusCode == http.StatusOK {
 				if err != nil || inputTokens < 0 {
 					slog.Error("redact response carried no input token count")
@@ -164,6 +166,7 @@ func newGatewayWithUsageContext(targets []*url.URL, reporter eventReporter, limi
 					Attributes:       eventAttributes(contextAttributes),
 				})
 				resp.Header.Set(billableRequestsHeader, "1")
+				resp.Header.Set(billableInputTokensHeader, strconv.FormatInt(inputTokens, 10))
 			}
 			return nil
 		}

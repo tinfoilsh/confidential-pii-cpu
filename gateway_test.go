@@ -116,8 +116,8 @@ func TestGatewayOwnsBilling(t *testing.T) {
 			if event.APIKey != strings.TrimPrefix(tc.auth, "Bearer ") || event.CustomerRequests != 1 || event.Operation.Service != usage.ServiceRouter || event.Operation.Name != usage.OperationRouterModelRequest || event.Attributes["model"] != billingModel || event.Attributes["route"] != redactPath {
 				t.Fatalf("incorrect attribution: %+v", event)
 			}
-			if event.RequestID == "" || event.EventID == "" || response.Header().Get(billableRequestsHeader) != "1" {
-				t.Fatal("missing event identity or receipt")
+			if event.RequestID == "" || event.EventID == "" || response.Header().Get(billableRequestsHeader) != "1" || response.Header().Get(billableInputTokensHeader) != "7" {
+				t.Fatalf("missing event identity or receipt: %v", response.Header())
 			}
 			if len(event.Meters) != 1 || event.Meters[0].Name != usage.MeterInputTokens || event.Meters[0].Quantity != 7 {
 				t.Fatalf("input tokens not metered: %+v", event.Meters)
