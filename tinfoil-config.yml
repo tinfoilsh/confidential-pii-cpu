@@ -64,6 +64,7 @@ networks:
 
 shim:
   upstream-port: 8001
+  drain_connections: true
   authenticated: true
   authenticated-endpoints:
     - /redact
